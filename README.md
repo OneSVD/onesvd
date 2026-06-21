@@ -24,7 +24,9 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
 ```
 
 That's it — no license keys, no limits, your data never leaves your machine. Prefer a managed
-node? See [OneSVD Cloud](https://onesvd.com/#pricing).
+node? 
+
+See [OneSVD Cloud](https://onesvd.com/#pricing).
 
 ## What it is
 
