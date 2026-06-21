@@ -95,8 +95,7 @@ Full docs live at **[onesvd.com/docs](https://onesvd.com/docs)**:
 ## Contributing
 
 Contributions are welcome. Please open an issue to discuss substantial changes before sending a pull
-request, and make sure existing checks pass. (Add `CONTRIBUTING.md` with your dev setup, coding
-standards, and PR process.)
+request, and make sure existing checks pass.
 
 ## License
 
