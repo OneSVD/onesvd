@@ -23,10 +23,7 @@ Self-host a fully featured node on your own hardware (Ubuntu Linux):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
 ```
 
-That's it — no license keys, no limits, your data never leaves your machine. Prefer a managed
-node? 
-
-See [OneSVD Cloud](https://onesvd.com/#pricing).
+That's it — no license keys, no limits, and your data never leaves your machine.
 
 ## What it is
 
@@ -94,16 +91,6 @@ Full docs live at **[onesvd.com/docs](https://onesvd.com/docs)**:
 - **Concepts** — The Merkle tree, Content addressing, Nodes & the hub
 - **Guides** — Git runners, Uploading files, Archiving & recovery, Access & sharing
 - **Reference** — Environment variables, CLI
-
-## Self-host or Cloud
-
-OneSVD runs the same open-source engine whether you host it yourself or let us run it:
-
-- **Self-host** — free forever, on your own hardware. This repo.
-- **OneSVD Cloud** — a dedicated managed node we run for you, priced transparently on compute,
-  storage, and egress. [See pricing](https://onesvd.com/#pricing).
-
-You can move between the two anytime — your data and hashes come with you.
 
 ## Contributing
 
