@@ -150,10 +150,21 @@ EOF
   NEEDS_PATH_ACTIVATION=1
 }
 
+# Remove any previous config so `onesvd up` re-asks which directory to watch on
+# every install. The installer stays idempotent — re-running just reconfigures
+# from scratch (the watched dir is reconfirmed, units are rewritten).
+reset_config() {
+  if [ -f "$CONFIG_DIR/config.yml" ]; then
+    info "clearing previous config for a fresh setup ($CONFIG_DIR/config.yml)"
+    rm -f "$CONFIG_DIR/config.yml"
+  fi
+}
+
 # ── run ────────────────────────────────────────────────────────────────────────
 install_toolchains
 fetch_source
 link_cli
+reset_config
 
 info "handing off to: onesvd up"
 echo
