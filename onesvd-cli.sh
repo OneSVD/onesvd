@@ -262,6 +262,37 @@ build_if_needed() {
 }
 
 # ── lifecycle ─────────────────────────────────────────────────────────────────
+# Enable systemd "linger" so the services keep running with no active login and
+# start at boot — essential for a headless/always-on box. This is the one step
+# that needs root, so we explain *why* up front instead of surprising the user
+# with a password prompt. Skipped automatically if linger is already on, if
+# loginctl is missing, or if ONESVD_NO_LINGER=1 (for unattended installs).
+enable_linger() {
+  have loginctl || return 0
+  local user; user="$(id -un)"
+
+  # already lingering? nothing to do, no password needed.
+  if loginctl show-user "$user" 2>/dev/null | grep -q '^Linger=yes'; then
+    info "linger already enabled (services run without an active login)"
+    return 0
+  fi
+
+  if [ "${ONESVD_NO_LINGER:-0}" = "1" ]; then
+    warn "skipping linger (ONESVD_NO_LINGER=1) — services start on next login, not at boot"
+    info "enable it later with:  sudo loginctl enable-linger $user"
+    return 0
+  fi
+
+  echo
+  info "sudo password needed once to enable systemd persistence"
+  if sudo loginctl enable-linger "$user"; then
+    ok "linger enabled — OneSVD will run headless and start at boot"
+  else
+    warn "linger not enabled — services start on next login instead of at boot"
+    info "you can enable it later with:  sudo loginctl enable-linger $user"
+  fi
+}
+
 cmd_up() {
   require_systemd
   ensure_config
@@ -282,10 +313,7 @@ cmd_up() {
   write_units
   "${SCTL[@]}" daemon-reload
 
-  if have loginctl; then
-    info "enabling linger so services start at boot"
-    sudo loginctl enable-linger "$(id -un)" 2>/dev/null || warn "could not enable linger (services start on next login instead)"
-  fi
+  enable_linger
 
   info "enabling + starting services"
   "${SCTL[@]}" enable --now "${SERVICES[@]}"
