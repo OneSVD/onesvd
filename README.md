@@ -20,7 +20,7 @@ recompute its integrity hash — so you can verify exactly what shipped, down to
 Self-host a fully featured node on your own hardware (Ubuntu Linux):
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | bash
 ```
 
 That's it — no license keys, no limits, and your data never leaves your machine.
