@@ -8,7 +8,7 @@ const APP_VERSION = "1.4.0"; // OneSVD interface version
 // at build time and injected as NEXT_PUBLIC_ONESVD_BUILD_HASH. Falls back to the
 // literal below when built outside the installer (e.g. local `next dev`).
 const BUILD_HASH = process.env.NEXT_PUBLIC_ONESVD_BUILD_HASH || "895cc96";
-const BUILD_HASH_SHORT = BUILD_HASH.slice(0, 12);
+const BUILD_HASH_SHORT = BUILD_HASH.slice(0, 7);
 
 // Hub URL is derived at runtime from the page's own location so the same build
 // runs anywhere — localhost over HTTP or a domain over HTTPS — with no rebuild.
@@ -899,14 +899,6 @@ export default function HomePage() {
   return (
     <div className="svd">
       <style>{CSS}</style>
-
-      <div
-        className="build-badge"
-        title={`OneSVD build fingerprint — sha256 of client + server + worker\n${BUILD_HASH}`}
-      >
-        <span className="build-dot" aria-hidden />
-        <span className="build-mono">build {BUILD_HASH_SHORT}</span>
-      </div>
 
       <nav className="nav">
         <button className="brand" onClick={() => setCwd(".")} aria-label="OneSVD — home">
@@ -2392,20 +2384,6 @@ const CSS = `
   pointer-events: none; /* wrap is transparent to clicks; children re-enable */
 }
 .fab-scrim { position: fixed; inset: 0; pointer-events: auto; }
-/* fixed bottom-right build fingerprint — sha256 of client+server+worker */
-.build-badge {
-  position: fixed; right: 14px; bottom: 10px; z-index: 40;
-  display: flex; align-items: center; gap: 6px;
-  padding: 3px 9px; border-radius: 999px;
-  background: var(--panel); border: 1px solid var(--border);
-  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.02em;
-  color: var(--muted); opacity: 0.6; user-select: none;
-  backdrop-filter: blur(6px); transition: opacity .15s ease, color .15s ease;
-}
-.build-badge:hover { opacity: 1; color: var(--text); }
-.build-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: 0 0 auto; box-shadow: 0 0 6px var(--accent-glow); }
-.build-mono { white-space: nowrap; }
-
 .fab {
   width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
   background: var(--accent); color: #04130D; display: grid; place-items: center;
