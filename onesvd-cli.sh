@@ -276,9 +276,22 @@ build_if_needed() {
   [ -d "$HUB_DIR/node_modules" ]       || need=1
   [ -d "$FRONTEND_DIR/node_modules" ]  || need=1
   [ "$mode" = "prod" ] && [ ! -d "$FRONTEND_DIR/.next" ] && need=1
+
+  # also rebuild when the source fingerprint differs from what we last built —
+  # this is what catches a `git pull` that changed files but left artifacts in
+  # place. The fingerprint doubles as the build's change-detector.
+  local cur prev=""; cur="$(compute_build_hash)"
+  [ -f "$ONESVD_HOME/.build-hash" ] && prev="$(cat "$ONESVD_HOME/.build-hash")"
+  if [ "$need" -eq 0 ] && [ "$cur" != "$prev" ]; then
+    need=1
+    info "source changed since last build (${cur:0:12}) — rebuilding"
+  fi
+
   if [ "$need" -eq 1 ]; then
-    info "building (first run or missing artifacts)"
+    info "building (first run, missing artifacts, or source changed)"
     cmd_build
+  else
+    info "build up to date (${cur:0:12})"
   fi
 }
 
