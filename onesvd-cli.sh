@@ -133,6 +133,17 @@ ready_banner() {
 }
 
 # ── build ─────────────────────────────────────────────────────────────────────
+# A content fingerprint of the source we're about to build: sha256 over every
+# file in client + server + worker (excluding generated artifacts), then a
+# sha256 of that list. Deterministic — same source, same hash.
+compute_build_hash() {
+  { find "$FRONTEND_DIR" "$HUB_DIR" "$WATCHER_DIR" -type f \
+      -not -path '*/node_modules/*' -not -path '*/.next/*' -not -path '*/.git/*' \
+      -not -name 'onesvd-watcher' \
+      -print0 2>/dev/null | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null; } \
+    | sha256sum | awk '{print $1}'
+}
+
 cmd_build() {
   have go   || die "Go not found — re-run install.sh to set up toolchains"
   have node || die "Node not found — re-run install.sh to set up toolchains"
@@ -140,6 +151,14 @@ cmd_build() {
   [ -f "$HUB_DIR/server.js" ]   || die "no server.js in $HUB_DIR"
   [ -d "$FRONTEND_DIR" ]        || die "no client in $FRONTEND_DIR"
   local mode; mode="$(cval frontend_mode prod)"
+
+  # fingerprint the source and inject it so the client can show which build is
+  # running. Exported here so 'next build' inlines NEXT_PUBLIC_ONESVD_BUILD_HASH;
+  # also saved to .build-hash so write_units can pass it to dev-mode runtime.
+  local build_hash; build_hash="$(compute_build_hash)"
+  echo "$build_hash" > "$ONESVD_HOME/.build-hash"
+  export NEXT_PUBLIC_ONESVD_BUILD_HASH="$build_hash"
+  info "build fingerprint ${build_hash:0:12}  ${c_dim}(sha256 of client+server+worker)${c_off}"
 
   info "building Go watcher"
   ( cd "$WATCHER_DIR"
@@ -169,12 +188,13 @@ cmd_build() {
 # ── systemd unit generation ───────────────────────────────────────────────────
 write_units() {
   ensure_config
-  local watch_dir hub_port ingest_port frontend_port frontend_mode node npx fe_exec
+  local watch_dir hub_port ingest_port frontend_port frontend_mode node npx fe_exec build_hash
   watch_dir="$(cval watch_dir "$PWD")"
   hub_port="$(cval hub_port 4000)"
   ingest_port="$(cval ingest_port 4001)"
   frontend_port="$(cval frontend_port 7777)"
   frontend_mode="$(cval frontend_mode prod)"
+  build_hash=""; [ -f "$ONESVD_HOME/.build-hash" ] && build_hash="$(cat "$ONESVD_HOME/.build-hash")"
   node="$(command -v node)"; npx="$(command -v npx)"
   [ -n "$node" ] || die "node not found on PATH"
 
@@ -236,6 +256,7 @@ Wants=onesvd-hub.service
 Type=simple
 WorkingDirectory=$FRONTEND_DIR
 Environment=NEXT_PUBLIC_ONESVD_HUB_PORT=$hub_port
+Environment=NEXT_PUBLIC_ONESVD_BUILD_HASH=$build_hash
 ExecStart=$fe_exec
 Restart=on-failure
 RestartSec=2
