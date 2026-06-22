@@ -4,7 +4,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 // ── config ──────────────────────────────────────────────────────────────────
 const APP_VERSION = "1.4.0"; // OneSVD interface version
-const BUILD_HASH = "895cc96"; // OneSVD software build identifier (bump on release)
+// Build fingerprint: a sha256 over the client + server + worker source, computed
+// at build time and injected as NEXT_PUBLIC_ONESVD_BUILD_HASH. Falls back to the
+// literal below when built outside the installer (e.g. local `next dev`).
+const BUILD_HASH = process.env.NEXT_PUBLIC_ONESVD_BUILD_HASH || "895cc96";
+const BUILD_HASH_SHORT = BUILD_HASH.slice(0, 12);
 
 // Hub URL is derived at runtime from the page's own location so the same build
 // runs anywhere — localhost over HTTP or a domain over HTTPS — with no rebuild.
@@ -576,8 +580,9 @@ export default function HomePage() {
     }
   };
 
-  const copyLink = async (relPath: string) => {
-    const url = viewUrl(relPath);
+  const copyLink = async (relPath: string, type: "file" | "directory" = "file") => {
+    // directories have no single file to view — share their zip download instead
+    const url = type === "directory" ? zipUrl(relPath) : viewUrl(relPath);
     const ok = await copyTextToClipboard(url);
     pushToast(ok ? "Link copied" : "Couldn't copy link", ok ? "done" : "error");
   };
@@ -666,7 +671,7 @@ export default function HomePage() {
       >
         {Trash}
       </button>
-      <button className="act-btn" title="Copy link" aria-label={`Copy link to ${node.name}`} onClick={() => copyLink(node.path)}>
+      <button className="act-btn" title={node.type === "directory" ? "Copy zip link" : "Copy link"} aria-label={`Copy link to ${node.name}`} onClick={() => copyLink(node.path, node.type)}>
         {LinkIcon}
       </button>
       <a
@@ -686,6 +691,12 @@ export default function HomePage() {
         >
           {CsvIcon}
         </button>
+      )}
+      {cwd === "." && node.type === "file" && (
+        // placeholder so file rows line up with the folders' CSV-export column
+        <span className="act-btn act-placeholder" aria-hidden title="Structure export is available on folders">
+          {CsvIcon}
+        </span>
       )}
     </span>
   );
@@ -888,6 +899,14 @@ export default function HomePage() {
   return (
     <div className="svd">
       <style>{CSS}</style>
+
+      <div
+        className="build-badge"
+        title={`OneSVD build fingerprint — sha256 of client + server + worker\n${BUILD_HASH}`}
+      >
+        <span className="build-dot" aria-hidden />
+        <span className="build-mono">build {BUILD_HASH_SHORT}</span>
+      </div>
 
       <nav className="nav">
         <button className="brand" onClick={() => setCwd(".")} aria-label="OneSVD — home">
@@ -1099,7 +1118,7 @@ export default function HomePage() {
                 </span>
               );
             })()}
-            <span className="sb-version">OneSVD v{APP_VERSION} · {BUILD_HASH}</span>
+            <span className="sb-version">OneSVD v{APP_VERSION} · {BUILD_HASH_SHORT}</span>
           </div>
 
           {dragOver && (
@@ -1273,7 +1292,7 @@ export default function HomePage() {
               onCopy={async (h) => { const ok = await copyTextToClipboard(h); pushToast(ok ? "Hash copied" : "Couldn't copy hash", ok ? "done" : "error"); }}
               onCopyRoot={async () => { const ok = await copyTextToClipboard(tree.sha256); pushToast(ok ? "Root hash copied" : "Couldn't copy hash", ok ? "done" : "error"); }}
               onClose={() => setGraphOpen(false)}
-              onCopyLink={(p) => copyLink(p)}
+              onCopyLink={(p, t) => copyLink(p, t)}
               onDownload={(node) => { window.location.href = node.type === "file" ? downloadUrl(node.path) : zipUrl(node.path); }}
               onDelete={(node) => setConfirmDelete({ path: node.path, name: node.name, type: node.type })}
             />
@@ -1542,7 +1561,7 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
   tree: TreeNode; version: number;
   removing: Set<string>;
   onCopy: (h: string) => void;
-  onCopyLink: (path: string) => void;
+  onCopyLink: (path: string, type: "file" | "directory") => void;
   onDownload: (node: { path: string; name: string; type: "file" | "directory" }) => void;
   onDelete: (node: { path: string; name: string; type: "file" | "directory" }) => void;
   onCopyRoot: () => void;
@@ -1828,8 +1847,8 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
                       {Trash}
                     </button>
                   )}
-                  <button className="node-pop-btn" title="Copy link"
-                          onClick={() => { onCopyLink(picked.node.key); setPicked(null); }}>
+                  <button className="node-pop-btn" title={picked.node.type === "directory" ? "Copy zip link" : "Copy link"}
+                          onClick={() => { onCopyLink(picked.node.key, picked.node.type); setPicked(null); }}>
                     {LinkIcon}
                   </button>
                   <button className="node-pop-btn" title={picked.node.type === "file" ? "Download" : "Download as zip"}
@@ -1853,8 +1872,21 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
 
 
 const DiamondLg = (
-  <svg viewBox="0 0 32 32" width="34" height="34"><rect x="8" y="8" width="16" height="16" rx="4"
-    transform="rotate(45 16 16)" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg>
+  <svg viewBox="0 0 40 40" width="40" height="40" className="mtree" aria-hidden>
+    <path className="mtree-edge mtree-e1" d="M20 9 L11 19" />
+    <path className="mtree-edge mtree-e2" d="M20 9 L29 19" />
+    <path className="mtree-edge mtree-e3" d="M11 21 L6 31" />
+    <path className="mtree-edge mtree-e4" d="M11 21 L16 31" />
+    <path className="mtree-edge mtree-e5" d="M29 21 L24 31" />
+    <path className="mtree-edge mtree-e6" d="M29 21 L34 31" />
+    <rect className="mtree-node mtree-root" x="16" y="4" width="8" height="8" rx="2" transform="rotate(45 20 8)" />
+    <circle className="mtree-node mtree-n1" cx="11" cy="20" r="2.6" />
+    <circle className="mtree-node mtree-n2" cx="29" cy="20" r="2.6" />
+    <circle className="mtree-node mtree-l1" cx="6" cy="33" r="2.1" />
+    <circle className="mtree-node mtree-l2" cx="16" cy="33" r="2.1" />
+    <circle className="mtree-node mtree-l3" cx="24" cy="33" r="2.1" />
+    <circle className="mtree-node mtree-l4" cx="34" cy="33" r="2.1" />
+  </svg>
 );
 const Folder = (
   <svg viewBox="0 0 18 18" width="17" height="17"><path
@@ -2360,6 +2392,20 @@ const CSS = `
   pointer-events: none; /* wrap is transparent to clicks; children re-enable */
 }
 .fab-scrim { position: fixed; inset: 0; pointer-events: auto; }
+/* fixed bottom-right build fingerprint — sha256 of client+server+worker */
+.build-badge {
+  position: fixed; right: 14px; bottom: 10px; z-index: 40;
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 9px; border-radius: 999px;
+  background: var(--panel); border: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.02em;
+  color: var(--muted); opacity: 0.6; user-select: none;
+  backdrop-filter: blur(6px); transition: opacity .15s ease, color .15s ease;
+}
+.build-badge:hover { opacity: 1; color: var(--text); }
+.build-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: 0 0 auto; box-shadow: 0 0 6px var(--accent-glow); }
+.build-mono { white-space: nowrap; }
+
 .fab {
   width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
   background: var(--accent); color: #04130D; display: grid; place-items: center;
@@ -2949,6 +2995,8 @@ button.row { appearance: none; cursor: pointer; }
 }
 .act-btn:hover { color: var(--accent); border-color: rgba(22,225,160,0.35); background: var(--accent-dim); }
 .act-btn.act-danger:hover { color: #E0584F; border-color: rgba(224,88,79,0.4); background: rgba(224,88,79,0.1); }
+.act-btn.act-placeholder { cursor: default; opacity: 0.18; pointer-events: none; }
+.act-btn.act-placeholder:hover { color: var(--muted); border-color: transparent; background: transparent; }
 
 .row.is-ghost { opacity: 0.6; }
 .row.is-ghost .nm { color: var(--muted); font-style: italic; }
@@ -3012,6 +3060,49 @@ button.row { appearance: none; cursor: pointer; }
   display: grid; place-items: center; width: 60px; height: 60px; margin-bottom: 14px;
   color: var(--accent); border-radius: 16px; border: 1px solid rgba(22,225,160,0.3); background: var(--accent-dim);
   box-shadow: 0 0 40px -8px var(--accent-glow);
+}
+.mtree { width: 38px; height: 38px; }
+.mtree-edge { stroke: currentColor; stroke-width: 1.4; fill: none; opacity: 0.55; }
+.mtree-node { fill: none; stroke: currentColor; stroke-width: 1.5; }
+@media (prefers-reduced-motion: no-preference) {
+  /* One looping cycle (~4.8s): cascade IN top-down (root→leaves), hold, then
+     cascade OUT in reverse (leaves→root). Each tier gets its own keyframe whose
+     fade happens at a different point so the unbuild mirrors the build. */
+  .mtree-edge { stroke-dasharray: 26; }
+  /* leaves: fade out first */
+  .mtree-l1, .mtree-l2, .mtree-l3, .mtree-l4 { animation: mtree-leaf 4.8s ease-in-out infinite; }
+  .mtree-l1 { animation-delay: 1.20s; } .mtree-l2 { animation-delay: 1.28s; }
+  .mtree-l3 { animation-delay: 1.36s; } .mtree-l4 { animation-delay: 1.44s; }
+  /* leaf edges (mid→leaf) fade just after the leaves */
+  .mtree-e3, .mtree-e4, .mtree-e5, .mtree-e6 { animation: mtree-edge-leaf 4.8s ease-in-out infinite; }
+  .mtree-e3 { animation-delay: .85s; } .mtree-e4 { animation-delay: .93s; }
+  .mtree-e5 { animation-delay: 1s; }   .mtree-e6 { animation-delay: 1.08s; }
+  /* mid nodes fade next */
+  .mtree-n1, .mtree-n2 { animation: mtree-mid 4.8s ease-in-out infinite; }
+  .mtree-n1 { animation-delay: .6s; }  .mtree-n2 { animation-delay: .72s; }
+  /* root edges (root→mid) fade after mid nodes */
+  .mtree-e1, .mtree-e2 { animation: mtree-edge-root 4.8s ease-in-out infinite; }
+  .mtree-e1 { animation-delay: .35s; } .mtree-e2 { animation-delay: .45s; }
+  /* root fades last */
+  .mtree-root { animation: mtree-rootn 4.8s ease-in-out infinite; animation-delay: .05s; }
+
+  @keyframes mtree-leaf {
+    0% { opacity: 0; } 10% { opacity: 1; } 55% { opacity: 1; } 63% { opacity: 0; } 100% { opacity: 0; }
+  }
+  @keyframes mtree-edge-leaf {
+    0% { stroke-dashoffset: 26; opacity: 0; } 18% { stroke-dashoffset: 0; opacity: .55; }
+    60% { opacity: .55; } 70% { stroke-dashoffset: 0; opacity: 0; } 100% { stroke-dashoffset: 26; opacity: 0; }
+  }
+  @keyframes mtree-mid {
+    0% { opacity: 0; } 10% { opacity: 1; } 68% { opacity: 1; } 76% { opacity: 0; } 100% { opacity: 0; }
+  }
+  @keyframes mtree-edge-root {
+    0% { stroke-dashoffset: 26; opacity: 0; } 18% { stroke-dashoffset: 0; opacity: .55; }
+    74% { opacity: .55; } 84% { stroke-dashoffset: 0; opacity: 0; } 100% { stroke-dashoffset: 26; opacity: 0; }
+  }
+  @keyframes mtree-rootn {
+    0% { opacity: 0; } 10% { opacity: 1; } 84% { opacity: 1; } 94% { opacity: 0; } 100% { opacity: 0; }
+  }
 }
 @media (prefers-reduced-motion: no-preference) {
   .empty-glyph { animation: float 3.5s ease-in-out infinite; }
