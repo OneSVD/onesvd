@@ -51,7 +51,7 @@ step.
 
 ```bash
 # 1. Install the node
-curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | bash
 
 # 2. Drop a file into the watched root — it's fingerprinted on arrival
 cp ./build.tar.gz "$ONESVD_ROOT/"
