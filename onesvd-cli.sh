@@ -293,8 +293,36 @@ enable_linger() {
   fi
 }
 
+# On first run (no config yet), confirm the directory to watch. Defaults to where
+# the installer was launched. Reads from /dev/tty so it still works under
+# `curl ... | bash` (where stdin is the piped script, not the keyboard). If
+# there's no terminal to ask, it silently keeps the default.
+choose_watch_dir() {
+  local target; target="$(cd "$DEF_WATCH_DIR" 2>/dev/null && pwd || echo "$DEF_WATCH_DIR")"
+  DEF_WATCH_DIR="$target"
+
+  [ -e /dev/tty ] || return 0   # no terminal → keep default, don't block
+
+  local ans=""
+  echo
+  printf "  Watch this directory for changes?\n    %s\n  [Y/n] " "$target"
+  if ! read -r ans < /dev/tty 2>/dev/null; then echo; return 0; fi
+
+  case "$ans" in
+    [nN]*)
+      local custom=""
+      printf "  Enter the directory to watch: "
+      read -r custom < /dev/tty 2>/dev/null || custom=""
+      custom="${custom/#\~/$HOME}"
+      [ -n "$custom" ] && DEF_WATCH_DIR="$(cd "$custom" 2>/dev/null && pwd || echo "$custom")"
+      ;;
+  esac
+  ok "watching: $DEF_WATCH_DIR"
+}
+
 cmd_up() {
   require_systemd
+  [ -f "$CONFIG_FILE" ] || choose_watch_dir   # first run: confirm the watched dir
   ensure_config
   build_if_needed
   [ -x "$WATCHER_DIR/onesvd-watcher" ] || die "watcher not built — run: onesvd build"
