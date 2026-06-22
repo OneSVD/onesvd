@@ -201,7 +201,11 @@ write_units() {
   mkdir -p "$UNIT_DIR" "$watch_dir"
   info "writing units to $UNIT_DIR"
 
-  cat > "$UNIT_DIR/onesvd-hub.service" <<EOF
+  # render into a temp dir first so we can tell whether anything actually
+  # changed — that decides whether cmd_up needs to restart at all.
+  local tmp; tmp="$(mktemp -d)"
+
+  cat > "$tmp/onesvd-hub.service" <<EOF
 [Unit]
 Description=OneSVD hub (WebSocket + HTTP)
 After=network.target
@@ -216,12 +220,13 @@ Environment=NEXT_PUBLIC_ONESVD_HUB_PORT=$hub_port
 ExecStart=$node $HUB_DIR/server.js
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target
 EOF
 
-  cat > "$UNIT_DIR/onesvd-watcher.service" <<EOF
+  cat > "$tmp/onesvd-watcher.service" <<EOF
 [Unit]
 Description=OneSVD filesystem watcher
 After=onesvd-hub.service
@@ -236,6 +241,7 @@ Environment=ONESVD_INGEST_PORT=$ingest_port
 ExecStart=$WATCHER_DIR/onesvd-watcher
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target
@@ -246,7 +252,7 @@ EOF
   else
     fe_exec="$npx next dev -p $frontend_port"
   fi
-  cat > "$UNIT_DIR/onesvd-frontend.service" <<EOF
+  cat > "$tmp/onesvd-frontend.service" <<EOF
 [Unit]
 Description=OneSVD frontend (Next.js, $frontend_mode)
 After=onesvd-hub.service
@@ -260,16 +266,29 @@ Environment=NEXT_PUBLIC_ONESVD_BUILD_HASH=$build_hash
 ExecStart=$fe_exec
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target
 EOF
+
+  # install the rendered units, noting whether any content actually changed
+  UNITS_CHANGED=0
+  local s
+  for s in "${SERVICES[@]}"; do
+    if ! cmp -s "$tmp/$s.service" "$UNIT_DIR/$s.service" 2>/dev/null; then
+      UNITS_CHANGED=1
+    fi
+    cp "$tmp/$s.service" "$UNIT_DIR/$s.service"
+  done
+  rm -rf "$tmp"
 
   ok "units written (watching $watch_dir)"
 }
 
 # build only what's missing, given the current config
 build_if_needed() {
+  DID_BUILD=0
   local mode; mode="$(cval frontend_mode prod)"
   local need=0
   [ -x "$WATCHER_DIR/onesvd-watcher" ] || need=1
@@ -288,6 +307,7 @@ build_if_needed() {
   fi
 
   if [ "$need" -eq 1 ]; then
+    DID_BUILD=1
     info "building (first run, missing artifacts, or source changed)"
     cmd_build
   else
@@ -361,24 +381,22 @@ cmd_up() {
   build_if_needed
   [ -x "$WATCHER_DIR/onesvd-watcher" ] || die "watcher not built — run: onesvd build"
 
-  # reclaim our own ports if a previous run is up
-  if "${SCTL[@]}" list-unit-files "onesvd-*.service" >/dev/null 2>&1; then
-    info "stopping any existing OneSVD services"
-    "${SCTL[@]}" stop "${SERVICES[@]}" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6; do
-      port_busy "$(cval hub_port 4000)" || port_busy "$(cval frontend_port 7777)" || break
-      sleep 0.5
-    done
-  fi
-
-  check_ports
   write_units
   "${SCTL[@]}" daemon-reload
-
   enable_linger
+  "${SCTL[@]}" enable "${SERVICES[@]}" >/dev/null 2>&1 || true   # start at boot
 
-  info "enabling + starting services"
-  "${SCTL[@]}" enable --now "${SERVICES[@]}"
+  # No explicit stop: start if nothing's running, restart only when the build or
+  # the unit files actually changed, otherwise leave the services running as-is.
+  if ! running; then
+    info "starting services"
+    "${SCTL[@]}" start "${SERVICES[@]}"
+  elif [ "${DID_BUILD:-0}" = "1" ] || [ "${UNITS_CHANGED:-0}" = "1" ]; then
+    info "applying changes — restarting services"
+    "${SCTL[@]}" restart "${SERVICES[@]}"
+  else
+    info "no changes — services left running"
+  fi
 
   local fp; fp="$(cval frontend_port 7777)"
   info "waiting for the WebUI on :$fp"
