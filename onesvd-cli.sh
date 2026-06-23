@@ -194,15 +194,21 @@ cmd_build() {
 # ── systemd unit generation ───────────────────────────────────────────────────
 write_units() {
   ensure_config
-  local watch_dir hub_port ingest_port frontend_port frontend_mode node npx fe_exec commit
+  local watch_dir hub_port ingest_port frontend_port frontend_mode node node_dir next_bin fe_exec commit
   watch_dir="$(cval watch_dir "$PWD")"
   hub_port="$(cval hub_port 4000)"
   ingest_port="$(cval ingest_port 4001)"
   frontend_port="$(cval frontend_port 7777)"
   frontend_mode="$(cval frontend_mode prod)"
   commit=""; [ -f "$ONESVD_HOME/.build-commit" ] && commit="$(cat "$ONESVD_HOME/.build-commit")"
-  node="$(command -v node)"; npx="$(command -v npx)"
+  node="$(command -v node)"
   [ -n "$node" ] || die "node not found on PATH"
+  # systemd user services run with a minimal PATH that won't include nvm/NodeSource
+  # node, so anything resolving `env node` fails. Bake in node's dir as the unit
+  # PATH, and invoke next.js directly through this node (no npx -> no env-node hop).
+  node_dir="$(dirname "$node")"
+  next_bin="$FRONTEND_DIR/node_modules/next/dist/bin/next"
+  [ -f "$next_bin" ] || next_bin="$FRONTEND_DIR/node_modules/.bin/next"
 
   mkdir -p "$UNIT_DIR" "$watch_dir"
   info "writing units to $UNIT_DIR"
@@ -219,6 +225,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$HUB_DIR
+Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin
 Environment=ONESVD_ROOT=$watch_dir
 Environment=ONESVD_HUB_PORT=$hub_port
 Environment=ONESVD_INGEST_PORT=$ingest_port
@@ -241,6 +248,7 @@ Wants=onesvd-hub.service
 [Service]
 Type=simple
 WorkingDirectory=$WATCHER_DIR
+Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin
 Environment=ONESVD_ROOT=$watch_dir
 Environment=ONESVD_HUB_PORT=$hub_port
 Environment=ONESVD_INGEST_PORT=$ingest_port
@@ -254,9 +262,9 @@ WantedBy=default.target
 EOF
 
   if [ "$frontend_mode" = "prod" ]; then
-    fe_exec="$npx next start -p $frontend_port"
+    fe_exec="$node $next_bin start -p $frontend_port"
   else
-    fe_exec="$npx next dev -p $frontend_port"
+    fe_exec="$node $next_bin dev -p $frontend_port"
   fi
   cat > "$tmp/onesvd-frontend.service" <<EOF
 [Unit]
@@ -267,6 +275,7 @@ Wants=onesvd-hub.service
 [Service]
 Type=simple
 WorkingDirectory=$FRONTEND_DIR
+Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin
 Environment=NEXT_PUBLIC_ONESVD_HUB_PORT=$hub_port
 Environment=NEXT_PUBLIC_ONESVD_COMMIT=$commit
 ExecStart=$fe_exec
