@@ -4,11 +4,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 // ── config ──────────────────────────────────────────────────────────────────
 const APP_VERSION = "1.4.0"; // OneSVD interface version
-// Build fingerprint: a sha256 over the client + server + worker source, computed
-// at build time and injected as NEXT_PUBLIC_ONESVD_BUILD_HASH. Falls back to the
-// literal below when built outside the installer (e.g. local `next dev`).
-const BUILD_HASH = process.env.NEXT_PUBLIC_ONESVD_BUILD_HASH || "895cc96";
-const BUILD_HASH_SHORT = BUILD_HASH.slice(0, 7);
+// Source commit of the running build, injected as NEXT_PUBLIC_ONESVD_COMMIT at
+// build time. Falls back to the literal below when built outside the installer.
+const COMMIT = process.env.NEXT_PUBLIC_ONESVD_COMMIT || "895cc96";
+const COMMIT_SHORT = COMMIT.slice(0, 7);
 
 // Hub URL is derived at runtime from the page's own location so the same build
 // runs anywhere — localhost over HTTP or a domain over HTTPS — with no rebuild.
@@ -1110,7 +1109,7 @@ export default function HomePage() {
                 </span>
               );
             })()}
-            <span className="sb-version">OneSVD v{APP_VERSION} · {BUILD_HASH_SHORT}</span>
+            <span className="sb-version">OneSVD v{APP_VERSION} · {COMMIT_SHORT}</span>
           </div>
 
           {dragOver && (
