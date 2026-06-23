@@ -136,12 +136,17 @@ ready_banner() {
 # A content fingerprint of the source we're about to build: sha256 over every
 # file in client + server + worker (excluding generated artifacts), then a
 # sha256 of that list. Deterministic — same source, same hash.
-compute_build_hash() {
-  { find "$FRONTEND_DIR" "$HUB_DIR" "$WATCHER_DIR" -type f \
-      -not -path '*/node_modules/*' -not -path '*/.next/*' -not -path '*/.git/*' \
-      -not -name 'onesvd-watcher' \
-      -print0 2>/dev/null | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null; } \
-    | sha256sum | awk '{print $1}'
+# The source version we display + use to decide whether to rebuild: the short
+# git commit of the checkout. Stable across builds (unlike a content hash, which
+# picks up files the build itself regenerates, e.g. next-env.d.ts). Falls back
+# to "dev" when not a git checkout.
+source_version() {
+  local v=""
+  if have git && [ -d "$ONESVD_HOME/.git" ]; then
+    v="$(git -C "$ONESVD_HOME" rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  [ -n "$v" ] || v="dev"
+  echo "$v"
 }
 
 cmd_build() {
@@ -153,12 +158,13 @@ cmd_build() {
   local mode; mode="$(cval frontend_mode prod)"
 
   # fingerprint the source and inject it so the client can show which build is
-  # running. Exported here so 'next build' inlines NEXT_PUBLIC_ONESVD_BUILD_HASH;
-  # also saved to .build-hash so write_units can pass it to dev-mode runtime.
-  local build_hash; build_hash="$(compute_build_hash)"
-  echo "$build_hash" > "$ONESVD_HOME/.build-hash"
-  export NEXT_PUBLIC_ONESVD_BUILD_HASH="$build_hash"
-  info "build fingerprint ${build_hash:0:12}  ${c_dim}(sha256 of client+server+worker)${c_off}"
+  # stamp the build with the source commit so the client can show which version
+  # is running. Exported here so 'next build' inlines NEXT_PUBLIC_ONESVD_COMMIT;
+  # also saved to .build-commit so write_units can pass it to dev-mode runtime.
+  local commit; commit="$(source_version)"
+  echo "$commit" > "$ONESVD_HOME/.build-commit"
+  export NEXT_PUBLIC_ONESVD_COMMIT="$commit"
+  info "build $commit  ${c_dim}(git commit)${c_off}"
 
   info "building Go watcher"
   ( cd "$WATCHER_DIR"
@@ -188,13 +194,13 @@ cmd_build() {
 # ── systemd unit generation ───────────────────────────────────────────────────
 write_units() {
   ensure_config
-  local watch_dir hub_port ingest_port frontend_port frontend_mode node npx fe_exec build_hash
+  local watch_dir hub_port ingest_port frontend_port frontend_mode node npx fe_exec commit
   watch_dir="$(cval watch_dir "$PWD")"
   hub_port="$(cval hub_port 4000)"
   ingest_port="$(cval ingest_port 4001)"
   frontend_port="$(cval frontend_port 7777)"
   frontend_mode="$(cval frontend_mode prod)"
-  build_hash=""; [ -f "$ONESVD_HOME/.build-hash" ] && build_hash="$(cat "$ONESVD_HOME/.build-hash")"
+  commit=""; [ -f "$ONESVD_HOME/.build-commit" ] && commit="$(cat "$ONESVD_HOME/.build-commit")"
   node="$(command -v node)"; npx="$(command -v npx)"
   [ -n "$node" ] || die "node not found on PATH"
 
@@ -262,7 +268,7 @@ Wants=onesvd-hub.service
 Type=simple
 WorkingDirectory=$FRONTEND_DIR
 Environment=NEXT_PUBLIC_ONESVD_HUB_PORT=$hub_port
-Environment=NEXT_PUBLIC_ONESVD_BUILD_HASH=$build_hash
+Environment=NEXT_PUBLIC_ONESVD_COMMIT=$commit
 ExecStart=$fe_exec
 Restart=on-failure
 RestartSec=2
@@ -296,22 +302,21 @@ build_if_needed() {
   [ -d "$FRONTEND_DIR/node_modules" ]  || need=1
   [ "$mode" = "prod" ] && [ ! -d "$FRONTEND_DIR/.next" ] && need=1
 
-  # also rebuild when the source fingerprint differs from what we last built —
-  # this is what catches a `git pull` that changed files but left artifacts in
-  # place. The fingerprint doubles as the build's change-detector.
-  local cur prev=""; cur="$(compute_build_hash)"
-  [ -f "$ONESVD_HOME/.build-hash" ] && prev="$(cat "$ONESVD_HOME/.build-hash")"
+  # also rebuild when the source commit differs from what we last built — this
+  # catches a `git pull` that advanced the checkout but left artifacts in place.
+  local cur prev=""; cur="$(source_version)"
+  [ -f "$ONESVD_HOME/.build-commit" ] && prev="$(cat "$ONESVD_HOME/.build-commit")"
   if [ "$need" -eq 0 ] && [ "$cur" != "$prev" ]; then
     need=1
-    info "source changed since last build (${cur:0:12}) — rebuilding"
+    info "source updated to $cur — rebuilding"
   fi
 
   if [ "$need" -eq 1 ]; then
     DID_BUILD=1
-    info "building (first run, missing artifacts, or source changed)"
+    info "building (first run, missing artifacts, or source updated)"
     cmd_build
   else
-    info "build up to date (${cur:0:12})"
+    info "build up to date ($cur)"
   fi
 }
 
