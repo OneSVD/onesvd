@@ -754,6 +754,34 @@ const RUNNERS_FILE = path.join(__dirname, "runners.json"); // outside ROOT
 const POLL_MS = 15000;
 const SSH_DIR = "/home/ubuntu/.ssh";
 
+// ── per-runner build logs ─────────────────────────────────────────────────────
+// Every build's output is captured to runner-logs/<id>.log (and a capped
+// in-memory ring) so it survives a closed modal, a poll-triggered build, and a
+// hub restart — and can be fetched later via GET /runners/logs?id=. The log is
+// reset at the start of each build, so it always reflects the latest run.
+const RUNNER_LOG_DIR = path.join(__dirname, "runner-logs");
+try { fs.mkdirSync(RUNNER_LOG_DIR, { recursive: true }); } catch {}
+const LOG_RING = new Map();        // id -> recent chunks (string[])
+const LOG_RING_MAX = 1500;         // cap chunks kept in memory per runner
+const runnerLogFile = (id) => path.join(RUNNER_LOG_DIR, `${safeName(id)}.log`);
+
+function resetRunnerLog(id) {
+  LOG_RING.set(id, []);
+  try { fs.writeFileSync(runnerLogFile(id), ""); } catch {}
+}
+function appendRunnerLog(id, chunk) {
+  if (!id || !chunk) return;
+  let ring = LOG_RING.get(id);
+  if (!ring) { ring = []; LOG_RING.set(id, ring); }
+  ring.push(chunk);
+  if (ring.length > LOG_RING_MAX) ring.splice(0, ring.length - LOG_RING_MAX);
+  try { fs.appendFileSync(runnerLogFile(id), chunk); } catch {}
+}
+function readRunnerLog(id) {
+  try { return fs.readFileSync(runnerLogFile(id), "utf8"); }
+  catch { return (LOG_RING.get(id) || []).join(""); }
+}
+
 // Pick the SSH key to clone with. ONESVD_SSH_KEY wins; otherwise use the first
 // key found in /home/ubuntu/.ssh. The hub runs as root, which can read these.
 function pickSshKey() {
@@ -792,6 +820,7 @@ function loadRunners() {
     runners = JSON.parse(fs.readFileSync(RUNNERS_FILE, "utf8"));
     for (const r of runners) {
       r.status = "idle"; r.error = null; // transient fields reset
+      r.phase = null; r.buildStartedAt = null;
       if (!Array.isArray(r.written)) r.written = []; // tolerate older files
       // migrate records that predate the explicitBranch flag: if a branch is
       // stored, treat it as user-specified so it's never silently rewritten to
@@ -807,7 +836,8 @@ function saveRunners() {
   try {
     const persist = runners.map((r) => ({
       id: r.id, repo: r.repo, branch: r.branch, dest: r.dest,
-      build: r.build, artifacts: r.artifacts, lastSha: r.lastSha,
+      build: r.build, artifacts: r.artifacts, submodules: !!r.submodules,
+      explicitBranch: !!r.explicitBranch, lastSha: r.lastSha,
       lastBuilt: r.lastBuilt, addedAt: r.addedAt,
       written: r.written || [], // artifact paths — drives the purple UI after a restart
     }));
@@ -822,6 +852,7 @@ function publicRunner(r) {
     written: r.written || [],
     lastSha: r.lastSha, lastBuilt: r.lastBuilt, lastChecked: r.lastChecked || null,
     status: r.status, error: r.error,
+    phase: r.phase || null, buildStartedAt: r.buildStartedAt || null,
   };
 }
 function broadcastRunners() {
@@ -849,19 +880,60 @@ function repoNameFromUrl(u) {
 function gitMsg(id, phase, extra = {}) {
   broadcast({ kind: "git", id, phase, ...extra });
 }
-function runStreamed(id, cmd, args, opts) {
+// Stream a child process's output as runner log lines (broadcast + persisted).
+// Guards against hangs, which is what made a huge ardupilot clone look dead:
+//   guard.idleMs — no output for this long ⇒ considered stuck, killed
+//   guard.maxMs  — absolute cap on total runtime
+// A heartbeat line is emitted during quiet stretches so the UI shows liveness.
+function runStreamed(id, cmd, args, opts, guard = {}) {
+  const idleMs = guard.idleMs || 0;
+  const maxMs = guard.maxMs || 0;
+  const label = guard.label || cmd;
   return new Promise((resolve) => {
     let p;
     try {
       p = spawn(cmd, args, opts);
     } catch (e) {
-      gitMsg(id, "log", { line: `spawn error: ${e.message}\n` });
+      const line = `spawn error: ${e.message}\n`;
+      gitMsg(id, "log", { line }); appendRunnerLog(id, line);
       return resolve(1);
     }
-    p.stdout.on("data", (d) => gitMsg(id, "log", { line: d.toString() }));
-    p.stderr.on("data", (d) => gitMsg(id, "log", { line: d.toString() }));
-    p.on("error", (e) => { gitMsg(id, "log", { line: `error: ${e.message}\n` }); resolve(1); });
-    p.on("close", (code) => resolve(code == null ? 1 : code));
+    const started = Date.now();
+    let lastOut = Date.now();
+    let killed = "";
+    const emit = (line) => { gitMsg(id, "log", { line }); appendRunnerLog(id, line); };
+
+    let idleTimer = null, maxTimer = null, beat = null;
+    const clearAll = () => { clearInterval(beat); clearTimeout(idleTimer); clearTimeout(maxTimer); };
+    const killTree = (reason) => {
+      if (killed) return;
+      killed = reason;
+      emit(`\n✕ ${label}: ${reason} — terminating\n`);
+      try { p.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { p.kill("SIGKILL"); } catch {} }, 5000);
+    };
+    const armIdle = () => {
+      if (!idleMs) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => killTree(`no output for ${Math.round(idleMs / 1000)}s`), idleMs);
+    };
+    if (maxMs) maxTimer = setTimeout(() => killTree(`exceeded ${Math.round(maxMs / 1000)}s limit`), maxMs);
+    // heartbeat: during a quiet stretch (no process output for 15s) note that
+    // it's still alive and how long it's been running.
+    beat = setInterval(() => {
+      if (Date.now() - lastOut >= 15000) emit(`… ${label} still running (${Math.round((Date.now() - started) / 1000)}s)\n`);
+    }, 20000);
+    armIdle();
+
+    const onData = (d) => { lastOut = Date.now(); emit(d.toString()); armIdle(); };
+    p.stdout.on("data", onData);
+    p.stderr.on("data", onData);
+    p.on("error", (e) => { clearAll(); emit(`error: ${e.message}\n`); resolve(1); });
+    p.on("close", (code) => {
+      clearAll();
+      if (killed) return resolve(124); // timed out / killed
+      resolve(code == null ? 1 : code);
+    });
   });
 }
 
@@ -914,27 +986,28 @@ function normalizeBuild(b) {
   if (Array.isArray(b)) return b.filter(Boolean).join(" && ");
   return String(b);
 }
-function autoBuild(repoDir) {
-  if (fs.existsSync(path.join(repoDir, "package.json"))) return "npm install && npm run build --if-present";
-  if (fs.existsSync(path.join(repoDir, "Makefile"))) return "make";
-  return "";
-}
 
 async function buildRunner(runner) {
   if (runner.status === "building") return;
   runner.status = "building";
   runner.error = null;
+  runner.phase = "cloning";
+  runner.buildStartedAt = Date.now();
   broadcastRunners();
 
   const id = runner.id;
+  resetRunnerLog(id); // fresh log for this build
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "onesvd-git-"));
   const repoDir = path.join(tmp, "repo");
   try {
     gitMsg(id, "cloning", { repo: runner.repo, dest: runner.dest });
-    const cloneArgs = ["clone", "--depth", "1"];
+    // --progress forces git to emit progress over a pipe (it stays silent on a
+    // non-TTY otherwise — which is why a big clone looked hung with no logs).
+    const cloneArgs = ["clone", "--depth", "1", "--progress"];
     if (runner.branch) cloneArgs.push("--branch", runner.branch);
     cloneArgs.push(runner.repo, repoDir);
-    if ((await runStreamed(id, "git", cloneArgs, { cwd: tmp, env: gitEnv() })) !== 0) throw new Error("clone failed");
+    if ((await runStreamed(id, "git", cloneArgs, { cwd: tmp, env: gitEnv() },
+      { label: "clone", idleMs: 180000, maxMs: 1800000 })) !== 0) throw new Error("clone failed or timed out");
 
     // capture the commit we're building. We DON'T advance runner.lastSha yet —
     // only after a successful build — so a failed/interrupted build retries on
@@ -959,7 +1032,7 @@ async function buildRunner(runner) {
         console.warn(`[runner] ${shortRepoLog(runner.repo)}: .onesvd.yml branch '${cfgBranch}' does not exist on remote — ignoring, keeping '${runner.branch || "(default)"}'`);
       }
     }
-    const build = normalizeBuild(cfg.build) || runner.build || autoBuild(repoDir);
+    const build = normalizeBuild(cfg.build) || runner.build || "";
     const dest = safeRelPath(cfg.dest || runner.dest); // may be nested, e.g. "LargeStuff" or "a/b"
     const destAbs = dest === "" ? ROOT : path.resolve(ROOT, dest);
     if (destAbs !== ROOT && !destAbs.startsWith(ROOT + path.sep)) throw new Error("invalid destination");
@@ -970,13 +1043,35 @@ async function buildRunner(runner) {
       .map((x) => String(x).trim().replace(/^\/+/, ""))
       .filter(Boolean);
 
+    // Require explicit instructions — never auto-build or auto-dump a repo. A
+    // build runs only when a command is given (GUI runner field, or `build:` in
+    // the repo's .onesvd.yml). With neither a build nor artifacts configured,
+    // there's nothing to do — fail clearly instead of guessing.
+    if (!build && artifactList.length === 0) {
+      throw new Error("nothing to build or store — set a build command and/or artifacts on the runner, or add a .onesvd.yml to the repo");
+    }
+
+    // Optional submodules (heavy) — opt in via the runner (GUI) or `submodules:
+    // true` in .onesvd.yml. Repos like ardupilot don't build without them; most
+    // repos don't need them.
+    const wantSubmodules = !!runner.submodules || /^(1|true|yes)$/i.test(String(cfg.submodules || "").trim());
+    if (wantSubmodules) {
+      runner.phase = "submodules"; broadcastRunners();
+      gitMsg(id, "building", { cmd: "git submodule update --init --recursive" });
+      if ((await runStreamed(id, "git", ["-C", repoDir, "submodule", "update", "--init", "--recursive", "--depth", "1", "--progress"],
+        { env: gitEnv() }, { label: "submodules", idleMs: 180000, maxMs: 1800000 })) !== 0) throw new Error("submodule fetch failed or timed out");
+    }
+
     if (build) {
+      runner.phase = "building"; broadcastRunners();
       gitMsg(id, "building", { cmd: build });
-      if ((await runStreamed(id, "bash", ["-lc", build], { cwd: repoDir })) !== 0) throw new Error("build failed");
+      if ((await runStreamed(id, "bash", ["-lc", build], { cwd: repoDir },
+        { label: "build", idleMs: 600000, maxMs: 3600000 })) !== 0) throw new Error("build failed or timed out");
     } else {
       gitMsg(id, "log", { line: "no build step detected\n" });
     }
 
+    runner.phase = "copying"; broadcastRunners();
     gitMsg(id, "copying", { dest });
     // Deliver INTO dest without destroying the folder's other contents. We remove
     // only the entries this runner wrote on its previous build, then write fresh
@@ -1011,17 +1106,18 @@ async function buildRunner(runner) {
         written.push(joinRel(base));
       }
     } else {
-      // nothing named: auto-detect a build-output dir, else copy the repo into a
-      // subfolder named after the repo (so we don't dump repo files loose)
+      // No artifacts named, but a build ran — store its output. Auto-detect a
+      // standard build-output dir; if none exists, fail clearly rather than
+      // dumping the whole repo (which would store source, not artifacts).
       let picked = "";
       for (const c of ["dist", "build", "out", "public"]) {
         if (fs.existsSync(path.join(repoDir, c))) { picked = c; break; }
       }
+      if (!picked) throw new Error("build finished but no artifacts found — set `artifacts` to the output path(s), e.g. build/ or dist/");
       const subName = repoNameFromUrl(runner.repo);
       const target = path.join(destAbs, subName);
-      const srcDir = picked ? path.join(repoDir, picked) : repoDir;
-      gitMsg(id, "log", { line: `artifacts: ${picked || "(repo root)"} -> ${dest || "/"}/${subName}/\n` });
-      fs.cpSync(srcDir, target, { recursive: true, filter: noGit });
+      gitMsg(id, "log", { line: `artifacts: ${picked}/ -> ${dest || "/"}/${subName}/\n` });
+      fs.cpSync(path.join(repoDir, picked), target, { recursive: true, filter: noGit });
       written.push(joinRel(subName));
     }
 
@@ -1031,12 +1127,17 @@ async function buildRunner(runner) {
     runner.lastBuilt = Date.now();
     runner.status = "idle";
     runner.error = null;
+    runner.phase = "done";
+    runner.buildStartedAt = null;
     saveRunners();
     broadcastRunners();
     gitMsg(id, "done", { dest, sha: sha.slice(0, 7) });
   } catch (e) {
     runner.status = "error";
     runner.error = e.message || String(e);
+    runner.phase = "error";
+    runner.buildStartedAt = null;
+    appendRunnerLog(id, `\n✕ ${runner.error}\n`); // keep the failure in the saved log
     broadcastRunners();
     gitMsg(id, "error", { message: runner.error });
   } finally {
@@ -1186,6 +1287,7 @@ function handleAddRunner(req, res) {
       dest,
       build: opt.build ? String(opt.build) : "",
       artifacts: opt.artifacts ? String(opt.artifacts).replace(/^\/+/, "").trim() : "",
+      submodules: /^(1|true|yes|on)$/i.test(String(opt.submodules ?? "")),
       written: [],
       lastSha: null, lastBuilt: null, status: "idle", error: null, addedAt: Date.now(),
     };
@@ -1201,6 +1303,15 @@ function handleAddRunner(req, res) {
 function handleListRunners(req, res) {
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ runners: runners.map(publicRunner) }));
+}
+
+// GET /runners/logs?id= — the captured build log for one runner (latest build).
+function handleRunnerLogs(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const id = url.searchParams.get("id") || "";
+  if (!id) { res.writeHead(400); return res.end("missing id"); }
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(readRunnerLog(id));
 }
 
 function handleDeleteRunner(req, res) {
@@ -1292,6 +1403,7 @@ const requestHandler = (req, res) => {
       if (req.method === "POST" && req.url.startsWith("/delete")) return handleDelete(req, res);
       if (req.method === "POST" && req.url.startsWith("/runners/delete")) return handleDeleteRunner(req, res);
       if (req.method === "POST" && req.url.startsWith("/runners/build")) return handleBuildRunner(req, res);
+      if (req.method === "GET" && req.url.startsWith("/runners/logs")) return handleRunnerLogs(req, res);
       if (req.method === "POST" && req.url.startsWith("/git")) return handleAddRunner(req, res);
       if (req.method === "GET" && req.url.startsWith("/runners")) return handleListRunners(req, res);
       if (req.method === "GET" && req.url.startsWith("/zip")) return handleZip(req, res);
