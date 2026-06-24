@@ -767,17 +767,23 @@ function pickSshKey() {
 const SSH_KEY = pickSshKey();
 let runners = []; // {id, repo, branch, dest, build, artifacts, lastSha, lastBuilt, status, error, addedAt}
 
-// git over SSH: auto-accept new host keys, use the discovered key if present
+// git over SSH: auto-accept new host keys, use the discovered key if present.
+// GIT_TERMINAL_PROMPT=0 makes an HTTPS clone that needs credentials fail fast
+// instead of hanging the runner on an interactive username/password prompt
+// (public HTTPS repos clone fine; private ones should use SSH).
 function gitEnv() {
   let ssh = "ssh -o StrictHostKeyChecking=accept-new";
   if (SSH_KEY && fs.existsSync(SSH_KEY)) ssh += ` -i ${SSH_KEY} -o IdentitiesOnly=yes`;
-  return { ...process.env, GIT_SSH_COMMAND: ssh };
+  return { ...process.env, GIT_SSH_COMMAND: ssh, GIT_TERMINAL_PROMPT: "0" };
 }
-// SSH clone URLs only: scp-style git@host:owner/repo or ssh://git@host/owner/repo
-function isAllowedSsh(repo) {
+// Accept SSH (scp-style git@host:owner/repo or ssh://git@host/owner/repo) for
+// any repo, OR HTTPS for PUBLIC repos (cloned with no credentials). HTTPS to a
+// private repo isn't supported here — it would need a token; use SSH for those.
+function isAllowedRepo(repo) {
   return (
     /^git@(github\.com|gitlab\.com):[\w.-]+\/[\w.-]+(\.git)?$/.test(repo) ||
-    /^ssh:\/\/git@(github\.com|gitlab\.com)\/[\w.-]+\/[\w.-]+(\.git)?$/.test(repo)
+    /^ssh:\/\/git@(github\.com|gitlab\.com)\/[\w.-]+\/[\w.-]+(\.git)?$/.test(repo) ||
+    /^https:\/\/(www\.)?(github\.com|gitlab\.com)\/[\w.-]+\/[\w.-]+(\.git)?\/?$/.test(repo)
   );
 }
 
@@ -1151,9 +1157,9 @@ function handleAddRunner(req, res) {
     try { opt = JSON.parse(body || "{}"); } catch { res.writeHead(400); return res.end("bad json"); }
 
     const repo = String(opt.repo || "").trim();
-    if (!isAllowedSsh(repo)) {
+    if (!isAllowedRepo(repo)) {
       res.writeHead(400);
-      return res.end("repo must be an SSH URL: git@github.com:owner/repo.git (or gitlab.com)");
+      return res.end("repo must be a GitHub/GitLab URL — SSH (git@github.com:owner/repo.git) or HTTPS for public repos (https://github.com/owner/repo.git)");
     }
     const dest = opt.dest !== undefined ? safeRelPath(opt.dest) : safeName(repoNameFromUrl(repo));
     const destAbs = dest === "" ? ROOT : path.resolve(ROOT, dest);
