@@ -127,7 +127,8 @@ export default function HomePage() {
   const [folderModal, setFolderModal] = useState(false);
   const [modalOver, setModalOver] = useState(false);
   const [gitModal, setGitModal] = useState(false);
-  const [gitForm, setGitForm] = useState({ repo: "", branch: "", build: "", artifacts: "", dest: "" });
+  const [gitForm, setGitForm] = useState({ repo: "", branch: "", build: "", artifacts: "", dest: "", submodules: false });
+  const [showBuildCfg, setShowBuildCfg] = useState(false);
   const [gitJob, setGitJob] = useState<GitJob | null>(null);
   const [runners, setRunners] = useState<RunnerInfo[]>([]);
   const [disk, setDisk] = useState<{ total: number; free: number; used: number; quota: boolean } | null>(null);
@@ -461,19 +462,26 @@ export default function HomePage() {
     if (!repo) return;
     const dest = cwdRef.current === "." ? "" : cwdRef.current; // build into the folder we're viewing
     const branch = gitForm.branch.trim();
+    const build = gitForm.build.trim();
+    const artifacts = gitForm.artifacts.trim();
+    const submodules = gitForm.submodules;
     setGitJob({ id: "pending", phase: "cloning", dest: "", logs: [], error: undefined });
     try {
       const res = await fetch(GIT_URL, {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ repo, dest: dest || undefined, branch: branch || undefined }),
+        body: JSON.stringify({
+          repo, dest: dest || undefined, branch: branch || undefined,
+          build: build || undefined, artifacts: artifacts || undefined,
+          submodules: submodules || undefined,
+        }),
       });
       if (res.status === 401) { setGitJob(null); setTokenModal(true); return; }
       if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
       const { id } = await res.json();
       myBuilds.current.add(id); // user-triggered: show the in-modal build panel
       setGitJob({ id, phase: "cloning", dest: "", logs: [], error: undefined });
-      setGitForm({ repo: "", branch: "", build: "", artifacts: "", dest: "" });
+      setGitForm({ repo: "", branch: "", build: "", artifacts: "", dest: "", submodules: false });
       setShowAddRunner(false);
     } catch (e: any) {
       setGitJob({ id: "pending", phase: "error", dest: "", logs: [], error: e?.message || String(e) });
@@ -1339,8 +1347,9 @@ export default function HomePage() {
               /* ADD MODE — single focused task */
               <div className="gaddpane">
                 <p className="gadd-intro">
-                  Auto-clone &amp; build a repo over SSH on every commit (polled), dropping artifacts into the
-                  watched tree. Configure the build with a <code>.onesvd.yml</code> at the repo root.
+                  Auto-clone &amp; build a repo on every commit (polled), dropping artifacts into the
+                  watched tree. Add a build below, or commit a <code>.onesvd.yml</code> to the repo root.
+                  With neither, the runner won&apos;t build — it never guesses.
                 </p>
                 <div className="gform">
                   <label className="gfield">
@@ -1353,10 +1362,35 @@ export default function HomePage() {
                     <input className="ginput mono" type="text" placeholder="default branch"
                       value={gitForm.branch} onChange={(e) => setGitForm((f) => ({ ...f, branch: e.target.value }))} />
                   </label>
+
+                  <button type="button" className="gcfg-toggle" onClick={() => setShowBuildCfg((v) => !v)}>
+                    <span className={"gcfg-caret" + (showBuildCfg ? " open" : "")}>▸</span>
+                    Build configuration <em>optional</em>
+                  </button>
+                  {showBuildCfg ? (
+                    <div className="gcfg">
+                      <label className="gfield">
+                        <span className="glabel">Build command</span>
+                        <textarea className="ginput mono gcfg-cmd" rows={3} spellCheck={false}
+                          placeholder={"./waf configure --board CubeOrange\n./waf copter"}
+                          value={gitForm.build} onChange={(e) => setGitForm((f) => ({ ...f, build: e.target.value }))} />
+                      </label>
+                      <label className="gfield">
+                        <span className="glabel">Artifacts <em>output path(s) to store</em></span>
+                        <input className="ginput mono" type="text" placeholder="build/CubeOrange/bin"
+                          value={gitForm.artifacts} onChange={(e) => setGitForm((f) => ({ ...f, artifacts: e.target.value }))} />
+                      </label>
+                      <label className="gcheck">
+                        <input type="checkbox" checked={gitForm.submodules}
+                          onChange={(e) => setGitForm((f) => ({ ...f, submodules: e.target.checked }))} />
+                        <span>Fetch git submodules before building <em>(needed for repos like ArduPilot)</em></span>
+                      </label>
+                    </div>
+                  ) : null}
+
                   <p className="gform-note">
                     Builds into <code>{cwd === "." ? "/ (root)" : "/" + cwd}</code> — your current folder.
-                    Leave branch blank to track the repo's default. Build command and artifacts come from
-                    <code>.onesvd.yml</code> at the repo root. A branch in <code>.onesvd.yml</code> overrides this.
+                    A repo&apos;s <code>.onesvd.yml</code> overrides anything set here.
                   </p>
                   <div className="modal-actions">
                     <button className="mbtn mbtn--ghost" onClick={() => setShowAddRunner(false)}>Cancel</button>
@@ -2687,6 +2721,25 @@ const CSS = `
 .ginput::placeholder { color: var(--faint); }
 .ginput:focus { border-color: var(--accent); }
 .ginput.mono { font-family: var(--font-mono); font-size: 12px; }
+.gcfg-cmd { height: auto; min-height: 64px; padding: 9px 11px; line-height: 1.5; resize: vertical; }
+
+.gcfg-toggle {
+  display: flex; align-items: center; gap: 7px; align-self: flex-start;
+  background: none; border: none; padding: 2px 0; cursor: pointer;
+  font-size: 11.5px; font-weight: 600; color: var(--muted); transition: color .12s;
+}
+.gcfg-toggle:hover { color: var(--text); }
+.gcfg-toggle em { font-style: normal; color: var(--faint); font-weight: 400; }
+.gcfg-caret { display: inline-block; font-size: 10px; color: var(--faint); transition: transform .14s; }
+.gcfg-caret.open { transform: rotate(90deg); }
+.gcfg {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 14px; margin-top: 2px;
+  border: 1px solid var(--border); border-radius: 9px; background: rgba(255,255,255,0.015);
+}
+.gcheck { display: flex; align-items: flex-start; gap: 9px; font-size: 12.5px; color: var(--text); line-height: 1.45; cursor: pointer; }
+.gcheck input { margin-top: 2px; accent-color: var(--accent); flex: 0 0 auto; }
+.gcheck em { font-style: normal; color: var(--faint); }
 
 .gphases { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
 .gphase {
