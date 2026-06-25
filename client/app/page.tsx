@@ -47,12 +47,14 @@ const DOWNLOAD_BASE = `${HUB.http}/download`;
 const DELETE_URL = `${HUB.http}/delete`;
 const ZIP_BASE = `${HUB.http}/zip`;
 const UPLOAD_URL = `${HUB.http}/upload`;
+const MKDIR_URL = `${HUB.http}/mkdir`;
 const CHUNK_SIZE = 8 * 1024 * 1024;          // 8 MB chunks
 const CHUNK_THRESHOLD = 64 * 1024 * 1024;    // files larger than this upload resumably
 const UPLOAD_CANCEL_URL = `${HUB.http}/upload/cancel`;
 const GIT_URL = `${HUB.http}/git`;
 const RUNNERS_DELETE_URL = `${HUB.http}/runners/delete`;
 const RUNNERS_BUILD_URL = `${HUB.http}/runners/build`;
+const RUNNERS_LOGS_URL = `${HUB.http}/runners/logs`;
 const SESSION_URL = `${HUB.http}/session`; // exchange token -> cookie
 
 // bearer token for write endpoints; mirrored from React state into this holder
@@ -86,12 +88,17 @@ type Msg =
   | { kind: "runners"; runners: RunnerInfo[] }
   | { kind: "disk"; disk: { total: number; free: number; used: number; quota: boolean } };
 type GitPhase = "cloning" | "building" | "copying" | "done" | "error" | "log";
-type GitJob = { id: string; phase: GitPhase; dest: string; logs: string[]; error?: string };
+type RunHistory = {
+  runId: string; at: number; finishedAt: number; durationMs: number;
+  sha: string | null; status: "success" | "error"; error: string | null;
+};
 type RunnerInfo = {
   id: string; repo: string; branch: string; dest: string;
   written: string[];
   lastSha: string | null; lastBuilt: number | null; lastChecked?: number | null;
   status: "idle" | "building" | "error"; error: string | null;
+  phase?: string | null; buildStartedAt?: number | null;
+  history?: RunHistory[];
 };
 type Conn = "linking" | "live" | "offline";
 type PendingUpload = {
@@ -127,13 +134,18 @@ export default function HomePage() {
   const [folderModal, setFolderModal] = useState(false);
   const [modalOver, setModalOver] = useState(false);
   const [gitModal, setGitModal] = useState(false);
-  const [gitForm, setGitForm] = useState({ repo: "", branch: "", build: "", artifacts: "", dest: "", submodules: false });
+  const [gitForm, setGitForm] = useState({ repo: "", branch: "" });
   const [showBuildCfg, setShowBuildCfg] = useState(false);
-  const [gitJob, setGitJob] = useState<GitJob | null>(null);
+  const [showArtifacts, setShowArtifacts] = useState(false); // artifact list collapsed by default
   const [runners, setRunners] = useState<RunnerInfo[]>([]);
   const [disk, setDisk] = useState<{ total: number; free: number; used: number; quota: boolean } | null>(null);
   const [showAddRunner, setShowAddRunner] = useState(false);
   const [selectedRunnerId, setSelectedRunnerId] = useState<string | null>(null);
+  // build-log review for the selected runner
+  const [logText, setLogText] = useState("");
+  const [logRunId, setLogRunId] = useState<string | null>(null); // null = latest / live run
+  const [logLoading, setLogLoading] = useState(false);
+  const logBoxRef = useRef<HTMLPreElement>(null);
   const [collapsedRunnerGroups, setCollapsedRunnerGroups] = useState<Set<string>>(new Set());
   const [token, setToken] = useState("");
   const [tokenLoaded, setTokenLoaded] = useState(false);
@@ -216,7 +228,6 @@ export default function HomePage() {
   const runnersRef = useRef<RunnerInfo[]>([]);
   useEffect(() => { runnersRef.current = runners; }, [runners]);
   const buildToasts = useRef<Map<string, number>>(new Map()); // build id -> toast id
-  const myBuilds = useRef<Set<string>>(new Set()); // build ids the user triggered (show in-modal panel)
 
   // load saved bearer token once; keep the module-level holder in sync so the
   // upload XHR (a plain function) can read it too
@@ -255,11 +266,6 @@ export default function HomePage() {
       }).catch(() => {});
     }
   };
-  const gitLogRef = useRef<HTMLPreElement>(null);
-  useEffect(() => {
-    const el = gitLogRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [gitJob?.logs]);
 
   // when the real tree updates, reconcile optimistic state with reality
   useEffect(() => {
@@ -333,23 +339,8 @@ export default function HomePage() {
             if (tid != null) { updateToast(tid, { label: "Runner build failed", status: "error", error: msg.message || undefined }); setTimeout(() => dismissToast(tid), 6000); buildToasts.current.delete(msg.id); }
             else pushToast("Runner build failed", "error", msg.message || undefined);
           }
-          // The in-modal build panel (gitJob) is only for builds the user
-          // triggered here (add form or Rebuild button). Background poll builds
-          // are surfaced via toasts only — no lingering panel.
-          if (myBuilds.current.has(msg.id)) {
-            setGitJob((j) => {
-              const base: GitJob = j && j.id === msg.id ? j : { id: msg.id, phase: "cloning", dest: "", logs: [], error: undefined };
-              if (msg.phase === "log") return { ...base, logs: [...base.logs, msg.line || ""].slice(-400) };
-              if (msg.phase === "error") return { ...base, phase: "error", error: msg.message || "failed" };
-              if (msg.phase === "done") return { ...base, phase: "done", dest: msg.dest || base.dest };
-              return { ...base, phase: msg.phase, dest: msg.dest || base.dest };
-            });
-            if (msg.phase === "done" || msg.phase === "error") {
-              myBuilds.current.delete(msg.id);
-              const closeId = msg.id;
-              setTimeout(() => setGitJob((j) => (j && j.id === closeId ? null : j)), msg.phase === "done" ? 4000 : 8000);
-            }
-          }
+          // Live build output is shown in the selected runner's detail pane,
+          // which polls /runners/logs; nothing to do here beyond the toasts.
           return;
         }
         if (msg.kind === "disk") {
@@ -409,7 +400,7 @@ export default function HomePage() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [folderModal, confirmDelete, gitModal, tokenModal, gitJob]);
+  }, [folderModal, confirmDelete, gitModal, tokenModal]);
 
   const current = tree ? nodeAt(tree, cwd) : null;
   const items = useMemo(() => {
@@ -462,29 +453,20 @@ export default function HomePage() {
     if (!repo) return;
     const dest = cwdRef.current === "." ? "" : cwdRef.current; // build into the folder we're viewing
     const branch = gitForm.branch.trim();
-    const build = gitForm.build.trim();
-    const artifacts = gitForm.artifacts.trim();
-    const submodules = gitForm.submodules;
-    setGitJob({ id: "pending", phase: "cloning", dest: "", logs: [], error: undefined });
     try {
       const res = await fetch(GIT_URL, {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          repo, dest: dest || undefined, branch: branch || undefined,
-          build: build || undefined, artifacts: artifacts || undefined,
-          submodules: submodules || undefined,
-        }),
+        body: JSON.stringify({ repo, dest, branch: branch || undefined }),
       });
-      if (res.status === 401) { setGitJob(null); setTokenModal(true); return; }
+      if (res.status === 401) { setTokenModal(true); return; }
       if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
       const { id } = await res.json();
-      myBuilds.current.add(id); // user-triggered: show the in-modal build panel
-      setGitJob({ id, phase: "cloning", dest: "", logs: [], error: undefined });
-      setGitForm({ repo: "", branch: "", build: "", artifacts: "", dest: "", submodules: false });
+      setGitForm({ repo: "", branch: "" });
       setShowAddRunner(false);
+      setSelectedRunnerId(id); // open the runner's detail pane — its live log streams there
     } catch (e: any) {
-      setGitJob({ id: "pending", phase: "error", dest: "", logs: [], error: e?.message || String(e) });
+      pushToast("Couldn't add runner", "error", e?.message || String(e));
     }
   };
 
@@ -499,21 +481,67 @@ export default function HomePage() {
 
   const rebuildRunner = async (id: string) => {
     try {
-      myBuilds.current.add(id); // user-triggered: show the in-modal build panel
-      setGitJob({ id, phase: "cloning", dest: "", logs: [], error: undefined });
+      setSelectedRunnerId(id); // show this runner's live log in the detail pane
       const res = await fetch(`${RUNNERS_BUILD_URL}?id=${encodeURIComponent(id)}`, { method: "POST", headers: authHeaders() });
-      if (res.status === 401) { myBuilds.current.delete(id); setGitJob(null); setTokenModal(true); return; }
-      if (res.status === 409) { myBuilds.current.delete(id); setGitJob(null); pushToast("Already building", "done"); return; }
+      if (res.status === 401) { setTokenModal(true); return; }
+      if (res.status === 409) { pushToast("Already building", "done"); return; }
       if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
-      // build progress + completion arrive over WS (panel + toasts)
+      // build progress + completion arrive over WS (in-pane log + toasts)
     } catch (e: any) {
-      myBuilds.current.delete(id);
-      setGitJob(null);
       pushToast("Couldn't start build", "error", e?.message || String(e));
     }
   };
 
-  // open the Git Runners modal to a specific tab / selection. focusDir collapses
+  // ── build-log review ────────────────────────────────────────────────────────
+  const loadRunnerLog = async (runnerId: string, runId: string | null) => {
+    setLogLoading(true);
+    try {
+      const u = new URL(RUNNERS_LOGS_URL);
+      u.searchParams.set("id", runnerId);
+      if (runId) u.searchParams.set("run", runId);
+      const res = await fetch(u.toString(), { headers: authHeaders() });
+      setLogText(res.ok ? await res.text() : "");
+    } catch {
+      setLogText("");
+    } finally {
+      setLogLoading(false);
+    }
+  };
+
+  // when the selected runner changes, snap back to its latest/live run
+  useEffect(() => { setLogRunId(null); }, [selectedRunnerId]);
+
+  // fetch the chosen log (latest when logRunId is null, else that past run)
+  useEffect(() => {
+    if (!selectedRunnerId) { setLogText(""); return; }
+    loadRunnerLog(selectedRunnerId, logRunId);
+  }, [selectedRunnerId, logRunId]);
+
+  // while the selected runner is building and we're on the live run, poll the
+  // log so it streams; the build-history list + status come over WS separately.
+  const selectedRunner = runners.find((r) => r.id === selectedRunnerId) || null;
+  const selectedBuilding = selectedRunner?.status === "building";
+  useEffect(() => {
+    if (!selectedRunnerId || !selectedBuilding || logRunId !== null) return;
+    const t = setInterval(() => loadRunnerLog(selectedRunnerId, null), 1500);
+    return () => clearInterval(t);
+  }, [selectedRunnerId, selectedBuilding, logRunId]);
+
+  // when a build for the selected runner finishes, refresh the live log once
+  // (the final pass/fail line is written server-side, not streamed as a log line)
+  useEffect(() => {
+    if (selectedRunnerId && logRunId === null && !selectedBuilding) {
+      loadRunnerLog(selectedRunnerId, null);
+    }
+  }, [selectedRunner?.lastBuilt, selectedRunner?.status]);
+
+  // keep the log pinned to the bottom while viewing the live run
+  useEffect(() => {
+    if (logRunId === null && logBoxRef.current) {
+      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+    }
+  }, [logText, logRunId]);
+
   // every runner group except the one for that top-level directory — unless that
   // group has exactly one runner, in which case we just select it directly.
   const openRunners = (opts?: { add?: boolean; selectId?: string | null; focusDir?: string }) => {
@@ -868,14 +896,50 @@ export default function HomePage() {
     return { roots, flat };
   };
 
+  // dragging in an empty folder yields no files to upload, so ask the hub to
+  // create the folder(s) explicitly. Shows the same optimistic directory row an
+  // upload would, then lets the tree patch confirm it.
+  const createEmptyDirs = async (relDirs: string[]) => {
+    const baseCwd = cwdRef.current;
+    const optimistic = new Map<string, PendingUpload>();
+    for (const rel of relDirs) {
+      const seg = rel.split("/").filter(Boolean)[0];
+      if (!seg) continue;
+      const p = treeJoin(baseCwd, seg);
+      if (!optimistic.has(p)) optimistic.set(p, { path: p, name: seg, dir: baseCwd, type: "directory", size: 0, status: "uploading" });
+    }
+    if (optimistic.size) setPending((m) => { const n = new Map(m); for (const [k, v] of optimistic) n.set(k, v); return n; });
+    const clearOptimistic = () => setPending((m) => { const n = new Map(m); for (const k of optimistic.keys()) n.delete(k); return n; });
+
+    try {
+      for (const rel of relDirs) {
+        const dir = joinDir(baseCwd, rel);
+        const res = await fetch(`${MKDIR_URL}?dir=${encodeURIComponent(dir)}`, { method: "POST", headers: authHeaders() });
+        if (res.status === 401) throw new Error("AUTH");
+        if (!res.ok) throw new Error((await res.text().catch(() => "")) || "couldn't create folder");
+      }
+      const label = relDirs.length === 1 ? (relDirs[0].split("/").pop() || "folder") : `${relDirs.length} folders`;
+      pushToast(`Created ${label}`, "done");
+      setPending((m) => { const n = new Map(m); for (const [k, v] of optimistic) { const cur = n.get(k); if (cur) n.set(k, { ...cur, status: "processing" }); } return n; });
+      setTimeout(clearOptimistic, 15000); // safety net; the tree patch normally clears it
+    } catch (e: any) {
+      const auth = e?.message === "AUTH";
+      pushToast("Couldn't create folder", "error", auth ? "auth required" : (e?.message || String(e)));
+      clearOptimistic();
+      if (auth) setTokenModal(true);
+    }
+  };
+
   const processDrop = async (roots: any[], flat: File[]) => {
     let entries: { file: File; relPath: string }[] = [];
+    const emptyDirs: string[] = [];
     if (roots.length) {
-      for (const entry of roots) entries.push(...(await walkEntry(entry, "")));
+      for (const entry of roots) entries.push(...(await walkEntry(entry, "", emptyDirs)));
     } else if (flat.length) {
       entries = flat.map((f) => ({ file: f, relPath: "" }));
     }
     if (entries.length) uploadList(entries);
+    if (emptyDirs.length) createEmptyDirs(emptyDirs);
   };
 
   const onDrop = (e: React.DragEvent) => {
@@ -1347,9 +1411,9 @@ export default function HomePage() {
               /* ADD MODE — single focused task */
               <div className="gaddpane">
                 <p className="gadd-intro">
-                  Auto-clone &amp; build a repo on every commit (polled), dropping artifacts into the
-                  watched tree. Add a build below, or commit a <code>.onesvd.yml</code> to the repo root.
-                  With neither, the runner won&apos;t build — it never guesses.
+                  Auto-clone a repo on every commit (polled). Without a <code>.onesvd.yml</code>,
+                  the runner mirrors the whole repo into the folder below; add one to build it
+                  and store just the outputs instead.
                 </p>
                 <div className="gform">
                   <label className="gfield">
@@ -1365,36 +1429,23 @@ export default function HomePage() {
 
                   <button type="button" className="gcfg-toggle" onClick={() => setShowBuildCfg((v) => !v)}>
                     <span className={"gcfg-caret" + (showBuildCfg ? " open" : "")}>▸</span>
-                    Build configuration <em>optional</em>
+                    Example <code>.onesvd.yml</code>
                   </button>
                   {showBuildCfg ? (
-                    <div className="gcfg">
-                      <label className="gfield">
-                        <span className="glabel">Build command</span>
-                        <textarea className="ginput mono gcfg-cmd" rows={3} spellCheck={false}
-                          placeholder={"./waf configure --board CubeOrange\n./waf copter"}
-                          value={gitForm.build} onChange={(e) => setGitForm((f) => ({ ...f, build: e.target.value }))} />
-                      </label>
-                      <label className="gfield">
-                        <span className="glabel">Artifacts <em>output path(s) to store</em></span>
-                        <input className="ginput mono" type="text" placeholder="build/CubeOrange/bin"
-                          value={gitForm.artifacts} onChange={(e) => setGitForm((f) => ({ ...f, artifacts: e.target.value }))} />
-                      </label>
-                      <label className="gcheck">
-                        <input type="checkbox" checked={gitForm.submodules}
-                          onChange={(e) => setGitForm((f) => ({ ...f, submodules: e.target.checked }))} />
-                        <span>Fetch git submodules before building <em>(needed for repos like ArduPilot)</em></span>
-                      </label>
-                    </div>
+                    <pre className="gcfg-example">{`# commit this at the repo root
+build: npm install && npm run build
+artifacts: dist
+# submodules: true   # if the repo needs them`}</pre>
                   ) : null}
 
                   <p className="gform-note">
                     Builds into <code>{cwd === "." ? "/ (root)" : "/" + cwd}</code> — your current folder.
-                    A repo&apos;s <code>.onesvd.yml</code> overrides anything set here.
+                    The build command and artifacts are read from <code>.onesvd.yml</code> in the repo;
+                    a branch there overrides the one above.
                   </p>
                   <div className="modal-actions">
                     <button className="mbtn mbtn--ghost" onClick={() => setShowAddRunner(false)}>Cancel</button>
-                    <button className="mbtn mbtn--go" disabled={!gitForm.repo.trim()} onClick={submitGit}>Add &amp; build</button>
+                    <button className="mbtn mbtn--go" disabled={!gitForm.repo.trim()} onClick={submitGit}>Add runner</button>
                   </div>
                 </div>
               </div>
@@ -1484,16 +1535,6 @@ export default function HomePage() {
                           {selected.lastChecked ? relTime(selected.lastChecked) : "—"}
                         </span></div>
                       </div>
-                      {selected.written && selected.written.length > 0 && (
-                        <div className="gdtl-artifacts">
-                          <span className="rk">artifacts ({selected.written.length})</span>
-                          <div className="gdtl-art-list">
-                            {selected.written.map((w) => (
-                              <a key={w} className="rart" href={viewUrl(w)} target="_blank" rel="noopener noreferrer">/{w}</a>
-                            ))}
-                          </div>
-                        </div>
-                      )}
                       {selected.status === "error" && selected.error && <div className="rerr">✕ {selected.error}</div>}
                       <div className="gdtl-actions">
                         <button
@@ -1507,27 +1548,80 @@ export default function HomePage() {
                           {Trash} Remove runner
                         </button>
                       </div>
+
+                      {selected.written && selected.written.length > 0 && (
+                        <div className="gdtl-artifacts">
+                          <button type="button" className="gcfg-toggle" onClick={() => setShowArtifacts((v) => !v)}>
+                            <span className={"gcfg-caret" + (showArtifacts ? " open" : "")}>▸</span>
+                            Artifacts <em>({selected.written.length})</em>
+                          </button>
+                          {showArtifacts && (
+                            <div className="gdtl-art-list">
+                              {selected.written.map((w) => (
+                                <a key={w} className="rart" href={viewUrl(w)} target="_blank" rel="noopener noreferrer">/{w}</a>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="gdtl-runs">
+                        <div className="gdtl-runs-head">
+                          <span className="rk">build history</span>
+                          {selected.status === "building" && selected.phase && (
+                            <span className="gdtl-phase">{selected.phase}</span>
+                          )}
+                        </div>
+                        {(selected.history && selected.history.length) || selected.status === "building" ? (
+                          <div className="gdtl-run-list">
+                            {selected.status === "building" && (
+                              <button
+                                className={"grun grun--live" + (logRunId === null ? " is-active" : "")}
+                                onClick={() => setLogRunId(null)}
+                              >
+                                <span className="grun-dot grun-dot--live" />
+                                <span className="grun-main">building…</span>
+                                <span className="grun-time">{selected.phase || "running"}</span>
+                              </button>
+                            )}
+                            {(selected.history || []).map((h, i) => {
+                              const isLatest = i === 0 && selected.status !== "building";
+                              const active = logRunId === h.runId || (logRunId === null && isLatest);
+                              return (
+                                <button
+                                  key={h.runId}
+                                  className={"grun grun--" + h.status + (active ? " is-active" : "")}
+                                  onClick={() => setLogRunId(isLatest ? null : h.runId)}
+                                  title={h.error || undefined}
+                                >
+                                  <span className={"grun-dot grun-dot--" + h.status} />
+                                  <span className="grun-main">
+                                    {h.status === "success" ? "passed" : "failed"}{h.sha ? ` · ${h.sha}` : ""}
+                                  </span>
+                                  <span className="grun-time">{relTime(h.finishedAt)}{h.durationMs ? ` · ${fmtDur(h.durationMs)}` : ""}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="gdtl-hint">No runs yet — build to see history here.</p>
+                        )}
+
+                        <div className="gdtl-log">
+                          <div className="gdtl-log-head">
+                            <span className="rk">log{logLoading ? " · loading…" : ""}</span>
+                            <button
+                              className="glog-copy"
+                              disabled={!logText}
+                              onClick={() => { try { navigator.clipboard?.writeText(logText); pushToast("Log copied", "done"); } catch {} }}
+                            >copy</button>
+                          </div>
+                          <pre className="gdtl-log-box" ref={logBoxRef}>{logText || (logLoading ? "" : "No log for this run.")}</pre>
+                        </div>
+                      </div>
                     </div>
                   )}
                 </div>
-              </div>
-            )}
-
-            {gitJob && (
-              <div className="gbuild">
-                <div className="gphases">
-                  {(["cloning", "building", "copying", "done"] as const).map((ph) => {
-                    const order = ["cloning", "building", "copying", "done"];
-                    const cur = gitJob.phase === "error" ? -1 : order.indexOf(gitJob.phase);
-                    const idx = order.indexOf(ph);
-                    const state = gitJob.phase === "error" ? "idle" : idx < cur ? "done" : idx === cur ? "active" : "idle";
-                    return <span key={ph} className={`gphase is-${state}`}>{ph}</span>;
-                  })}
-                  <button className="glog-close" onClick={() => setGitJob(null)} aria-label="Dismiss log">{Cross}</button>
-                </div>
-                <pre className="glog" ref={gitLogRef}>{gitJob.logs.join("") || "starting…\n"}</pre>
-                {gitJob.phase === "error" && <p className="gerror">✕ {gitJob.error}</p>}
-                {gitJob.phase === "done" && <p className="gdone">✓ Artifacts added to <code>{gitJob.dest}</code></p>}
               </div>
             )}
           </div>
@@ -2141,6 +2235,13 @@ function relTime(ts: number | null): string {
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
 }
+function fmtDur(ms?: number): string {
+  if (!ms || ms < 0) return "";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), r = s % 60;
+  return r ? `${m}m ${r}s` : `${m}m`;
+}
 function shortRepo(url: string): string {
   return url
     .replace(/^git@(github|gitlab)\.com:/, "")
@@ -2167,15 +2268,18 @@ function treeJoin(dir: string, name: string): string {
 }
 // recursively read a dropped DataTransfer entry into {file, relPath} list,
 // where relPath is the directory path (relative to the drop), preserving structure.
-async function walkEntry(entry: any, dirPrefix: string): Promise<{ file: File; relPath: string }[]> {
+async function walkEntry(entry: any, dirPrefix: string, emptyDirs?: string[]): Promise<{ file: File; relPath: string }[]> {
   if (entry.isFile) {
     const file: File = await new Promise((res, rej) => entry.file(res, rej));
     return [{ file, relPath: dirPrefix }];
   }
   const here = dirPrefix ? `${dirPrefix}/${entry.name}` : entry.name;
   const children = await readAllEntries(entry.createReader());
+  // a folder with no children at all is an empty folder the user dragged in —
+  // there are no files to upload, so record it for explicit creation.
+  if (children.length === 0) { emptyDirs?.push(here); return []; }
   const out: { file: File; relPath: string }[] = [];
-  for (const c of children) out.push(...(await walkEntry(c, here)));
+  for (const c of children) out.push(...(await walkEntry(c, here, emptyDirs)));
   return out;
 }
 function readAllEntries(reader: any): Promise<any[]> {
@@ -2686,8 +2790,8 @@ const CSS = `
 .mbtn--go:hover { background: var(--accent-bright); border-color: var(--accent-bright); }
 .mbtn--go:disabled { opacity: 0.45; cursor: not-allowed; }
 
-.modal--git { max-width: 920px; max-height: calc(100vh - 40px); display: flex; flex-direction: column; }
-.modal--git .gsplit { grid-template-columns: 280px 1fr; min-height: 520px; flex: 1 1 auto; }
+.modal--git { max-width: none; width: 100%; height: calc(100vh - 40px); display: flex; flex-direction: column; overflow: hidden; }
+.modal--git .gsplit { grid-template-columns: 320px 1fr; grid-template-rows: minmax(0, 1fr); min-height: 0; flex: 1 1 auto; }
 .modal--git .gmaster-list { max-height: none; overflow-y: auto; overflow-x: hidden; }
 .gtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
 .gtab {
@@ -2721,7 +2825,6 @@ const CSS = `
 .ginput::placeholder { color: var(--faint); }
 .ginput:focus { border-color: var(--accent); }
 .ginput.mono { font-family: var(--font-mono); font-size: 12px; }
-.gcfg-cmd { height: auto; min-height: 64px; padding: 9px 11px; line-height: 1.5; resize: vertical; }
 
 .gcfg-toggle {
   display: flex; align-items: center; gap: 7px; align-self: flex-start;
@@ -2729,17 +2832,15 @@ const CSS = `
   font-size: 11.5px; font-weight: 600; color: var(--muted); transition: color .12s;
 }
 .gcfg-toggle:hover { color: var(--text); }
+.gcfg-toggle code { font-family: var(--font-mono); font-size: 11px; color: var(--text); background: var(--panel); padding: 1px 5px; border-radius: 4px; }
 .gcfg-toggle em { font-style: normal; color: var(--faint); font-weight: 400; }
 .gcfg-caret { display: inline-block; font-size: 10px; color: var(--faint); transition: transform .14s; }
 .gcfg-caret.open { transform: rotate(90deg); }
-.gcfg {
-  display: flex; flex-direction: column; gap: 12px;
-  padding: 14px; margin-top: 2px;
-  border: 1px solid var(--border); border-radius: 9px; background: rgba(255,255,255,0.015);
+.gcfg-example {
+  margin: 0; padding: 12px 14px; overflow-x: auto;
+  background: #06090b; border: 1px solid var(--border); border-radius: 8px;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--muted); white-space: pre;
 }
-.gcheck { display: flex; align-items: flex-start; gap: 9px; font-size: 12.5px; color: var(--text); line-height: 1.45; cursor: pointer; }
-.gcheck input { margin-top: 2px; accent-color: var(--accent); flex: 0 0 auto; }
-.gcheck em { font-style: normal; color: var(--faint); }
 
 .gphases { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
 .gphase {
@@ -2825,10 +2926,10 @@ const CSS = `
 .gadd-btn .radd-plus { display: grid; place-items: center; }
 .gadd-btn .radd-plus svg { width: 14px; height: 14px; }
 
-.gdetail { min-width: 0; }
+.gdetail { min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 .gdetail-empty { display: flex; flex-direction: column; gap: 10px; }
 .gdetail-hint { font-size: 12.5px; color: var(--faint); }
-.gdtl { display: flex; flex-direction: column; gap: 14px; }
+.gdtl { display: flex; flex-direction: column; gap: 14px; flex: 1; min-height: 0; }
 .gdtl-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .gdtl-repo { font-size: 15px; font-weight: 700; color: var(--text); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gdtl-repo:hover { color: var(--accent); }
@@ -2836,10 +2937,71 @@ const CSS = `
 .gdtl-field { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .gdtl-v { font-size: 12.5px; color: var(--text); font-family: var(--font-mono); word-break: break-all; }
 .gdtl-artifacts { display: flex; flex-direction: column; gap: 6px; }
-.gdtl-art-list { display: flex; flex-direction: column; gap: 4px; }
+.gdtl-art-list { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; padding-right: 2px; }
 .gdtl-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 4px; }
 .gdtl-actions .mbtn { display: inline-flex; align-items: center; gap: 7px; }
 .gdtl-actions .mbtn svg { width: 14px; height: 14px; }
+
+.gdtl-runs { display: flex; flex-direction: column; gap: 9px; border-top: 1px solid var(--border); padding-top: 14px; flex: 1; min-height: 0; }
+.gdtl-runs-head { display: flex; align-items: center; gap: 10px; }
+.gdtl-phase {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px;
+  color: #FFD43B; background: rgba(255,212,59,0.13); padding: 2px 7px; border-radius: 5px;
+}
+.gdtl-hint { font-size: 12px; color: var(--faint); margin: 0; }
+.gdtl-run-list { display: flex; flex-direction: column; gap: 4px; max-height: 148px; overflow-y: auto; flex: 0 0 auto; }
+.grun {
+  display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+  padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--panel); cursor: pointer; transition: border-color .12s, background .12s;
+}
+.grun:hover { border-color: var(--border-strong); }
+.grun.is-active { border-color: var(--accent); background: var(--accent-dim); }
+.grun-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+.grun-dot--success { background: var(--accent); }
+.grun-dot--error { background: #E0584F; }
+.grun-dot--live { background: #FFD43B; box-shadow: 0 0 0 0 rgba(255,212,59,0.6); animation: grunpulse 1.4s infinite; }
+@keyframes grunpulse { 0% { box-shadow: 0 0 0 0 rgba(255,212,59,0.5); } 70% { box-shadow: 0 0 0 6px rgba(255,212,59,0); } 100% { box-shadow: 0 0 0 0 rgba(255,212,59,0); } }
+.grun-main { font-size: 12px; font-weight: 600; color: var(--text); font-family: var(--font-mono); }
+.grun--error .grun-main { color: #E0584F; }
+.grun-time { margin-left: auto; font-size: 11px; color: var(--faint); white-space: nowrap; }
+
+.gdtl-log { display: flex; flex-direction: column; gap: 6px; flex: 1; min-height: 0; }
+.gdtl-log-head { display: flex; align-items: center; justify-content: space-between; }
+.glog-copy {
+  font-size: 11px; color: var(--muted); background: none; border: 1px solid var(--border);
+  border-radius: 5px; padding: 2px 9px; cursor: pointer; transition: border-color .12s, color .12s;
+}
+.glog-copy:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.glog-copy:disabled { opacity: 0.4; cursor: default; }
+.gdtl-log-box {
+  margin: 0; flex: 1; min-height: 0; overflow: auto;
+  background: #06090b; border: 1px solid var(--border); border-radius: 8px;
+  padding: 11px 13px; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+  color: var(--muted); white-space: pre-wrap; word-break: break-word;
+}
+
+/* dark, subtle scrollbars inside the runners modal (no white default) */
+.gdtl-log-box, .gdtl-run-list, .modal--git .gmaster-list {
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent;
+}
+.gdtl-log-box::-webkit-scrollbar,
+.gdtl-run-list::-webkit-scrollbar,
+.modal--git .gmaster-list::-webkit-scrollbar { width: 10px; height: 10px; }
+.gdtl-log-box::-webkit-scrollbar-track,
+.gdtl-run-list::-webkit-scrollbar-track,
+.modal--git .gmaster-list::-webkit-scrollbar-track { background: transparent; }
+.gdtl-log-box::-webkit-scrollbar-thumb,
+.gdtl-run-list::-webkit-scrollbar-thumb,
+.modal--git .gmaster-list::-webkit-scrollbar-thumb {
+  background: var(--border-strong); border-radius: 6px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+.gdtl-log-box::-webkit-scrollbar-thumb:hover,
+.gdtl-run-list::-webkit-scrollbar-thumb:hover,
+.modal--git .gmaster-list::-webkit-scrollbar-thumb:hover {
+  background: var(--muted); background-clip: padding-box;
+}
 
 .gbuild { margin-bottom: 14px; }
 .glog-close {
