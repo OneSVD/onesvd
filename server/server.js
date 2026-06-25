@@ -588,6 +588,28 @@ function handleDelete(req, res) {
   res.end(JSON.stringify({ ok: true }));
 }
 
+// POST /mkdir?dir=sub/path — create an empty folder. A dragged-in empty folder
+// has no files to upload, so the browser sends nothing; this lets the UI
+// materialize the folder explicitly. Resolves inside ROOT, never ROOT itself.
+function handleMkdir(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const rel = safeRelPath(url.searchParams.get("dir") || "");
+  if (!rel) { res.writeHead(400); return res.end("invalid dir"); }
+  const target = path.resolve(ROOT, rel);
+  if (target === ROOT || !target.startsWith(ROOT + path.sep)) {
+    res.writeHead(400);
+    return res.end("invalid dir");
+  }
+  try {
+    fs.mkdirSync(target, { recursive: true });
+  } catch (e) {
+    res.writeHead(500);
+    return res.end("mkdir failed: " + e.message);
+  }
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ ok: true, dir: rel }));
+}
+
 // ── zip handler (download a folder) ──────────────────────────────────────────
 
 function handleZip(req, res) {
@@ -754,20 +776,28 @@ const RUNNERS_FILE = path.join(__dirname, "runners.json"); // outside ROOT
 const POLL_MS = 15000;
 const SSH_DIR = "/home/ubuntu/.ssh";
 
-// ── per-runner build logs ─────────────────────────────────────────────────────
-// Every build's output is captured to runner-logs/<id>.log (and a capped
-// in-memory ring) so it survives a closed modal, a poll-triggered build, and a
-// hub restart — and can be fetched later via GET /runners/logs?id=. The log is
-// reset at the start of each build, so it always reflects the latest run.
+// ── per-runner build logs + run history ───────────────────────────────────────
+// Each build writes its own log file under runner-logs/<id>/<runId>.log (runId
+// is the start timestamp). We keep the last MAX_RUNS runs per runner — their
+// logs on disk and a compact pass/fail record in runner.history (persisted) —
+// so you can review past runs, not just the latest. Logs survive a closed
+// modal, a poll-triggered build, and a hub restart.
 const RUNNER_LOG_DIR = path.join(__dirname, "runner-logs");
 try { fs.mkdirSync(RUNNER_LOG_DIR, { recursive: true }); } catch {}
-const LOG_RING = new Map();        // id -> recent chunks (string[])
-const LOG_RING_MAX = 1500;         // cap chunks kept in memory per runner
-const runnerLogFile = (id) => path.join(RUNNER_LOG_DIR, `${safeName(id)}.log`);
+const MAX_RUNS = 15;              // run logs + history entries kept per runner
+const LOG_RING = new Map();       // id -> current run's chunks (live tail)
+const LOG_RING_MAX = 1500;
+const CURRENT_RUN = new Map();    // id -> runId of the in-flight build
 
-function resetRunnerLog(id) {
+const runnerDir = (id) => path.join(RUNNER_LOG_DIR, safeName(id));
+const runFile = (id, runId) => path.join(runnerDir(id), `${runId}.log`);
+
+function startRunLog(id) {
+  const runId = String(Date.now());
+  CURRENT_RUN.set(id, runId);
   LOG_RING.set(id, []);
-  try { fs.writeFileSync(runnerLogFile(id), ""); } catch {}
+  try { fs.mkdirSync(runnerDir(id), { recursive: true }); fs.writeFileSync(runFile(id, runId), ""); } catch {}
+  return runId;
 }
 function appendRunnerLog(id, chunk) {
   if (!id || !chunk) return;
@@ -775,11 +805,39 @@ function appendRunnerLog(id, chunk) {
   if (!ring) { ring = []; LOG_RING.set(id, ring); }
   ring.push(chunk);
   if (ring.length > LOG_RING_MAX) ring.splice(0, ring.length - LOG_RING_MAX);
-  try { fs.appendFileSync(runnerLogFile(id), chunk); } catch {}
+  const runId = CURRENT_RUN.get(id);
+  if (runId) { try { fs.appendFileSync(runFile(id, runId), chunk); } catch {} }
 }
-function readRunnerLog(id) {
-  try { return fs.readFileSync(runnerLogFile(id), "utf8"); }
-  catch { return (LOG_RING.get(id) || []).join(""); }
+function readRunnerLog(id, runId) {
+  if (runId) { try { return fs.readFileSync(runFile(id, runId), "utf8"); } catch { return ""; } }
+  const cur = CURRENT_RUN.get(id); // prefer the live run
+  if (cur) { try { return fs.readFileSync(runFile(id, cur), "utf8"); } catch { return (LOG_RING.get(id) || []).join(""); } }
+  try { // else newest file (runId is a sortable timestamp)
+    const files = fs.readdirSync(runnerDir(id)).filter((f) => f.endsWith(".log")).sort();
+    if (files.length) return fs.readFileSync(path.join(runnerDir(id), files[files.length - 1]), "utf8");
+  } catch {}
+  return "";
+}
+function pruneRuns(id, keepRunIds) {
+  try {
+    for (const f of fs.readdirSync(runnerDir(id))) {
+      if (!f.endsWith(".log")) continue;
+      if (!keepRunIds.includes(f.slice(0, -4))) { try { fs.rmSync(path.join(runnerDir(id), f)); } catch {} }
+    }
+  } catch {}
+}
+// Record a finished run in the runner's history, trim to MAX_RUNS, prune old logs.
+function recordRun(runner, runId, status, sha, error) {
+  if (!Array.isArray(runner.history)) runner.history = [];
+  const startedAt = Number(runId) || Date.now();
+  runner.history.unshift({
+    runId, at: startedAt, finishedAt: Date.now(), durationMs: Date.now() - startedAt,
+    sha: sha ? sha.slice(0, 7) : null, status, error: error || null,
+  });
+  if (runner.history.length > MAX_RUNS) runner.history = runner.history.slice(0, MAX_RUNS);
+  CURRENT_RUN.delete(runner.id);
+  pruneRuns(runner.id, runner.history.map((h) => h.runId));
+  saveRunners();
 }
 
 // Pick the SSH key to clone with. ONESVD_SSH_KEY wins; otherwise use the first
@@ -821,6 +879,7 @@ function loadRunners() {
     for (const r of runners) {
       r.status = "idle"; r.error = null; // transient fields reset
       r.phase = null; r.buildStartedAt = null;
+      if (!Array.isArray(r.history)) r.history = []; // run history persists
       if (!Array.isArray(r.written)) r.written = []; // tolerate older files
       // migrate records that predate the explicitBranch flag: if a branch is
       // stored, treat it as user-specified so it's never silently rewritten to
@@ -839,6 +898,7 @@ function saveRunners() {
       build: r.build, artifacts: r.artifacts, submodules: !!r.submodules,
       explicitBranch: !!r.explicitBranch, lastSha: r.lastSha,
       lastBuilt: r.lastBuilt, addedAt: r.addedAt,
+      history: Array.isArray(r.history) ? r.history.slice(0, MAX_RUNS) : [],
       written: r.written || [], // artifact paths — drives the purple UI after a restart
     }));
     fs.writeFileSync(RUNNERS_FILE, JSON.stringify(persist, null, 2));
@@ -853,6 +913,7 @@ function publicRunner(r) {
     lastSha: r.lastSha, lastBuilt: r.lastBuilt, lastChecked: r.lastChecked || null,
     status: r.status, error: r.error,
     phase: r.phase || null, buildStartedAt: r.buildStartedAt || null,
+    history: Array.isArray(r.history) ? r.history : [],
   };
 }
 function broadcastRunners() {
@@ -996,7 +1057,8 @@ async function buildRunner(runner) {
   broadcastRunners();
 
   const id = runner.id;
-  resetRunnerLog(id); // fresh log for this build
+  const runId = startRunLog(id); // new per-run log
+  let sha = "";                  // hoisted so the catch block can record it
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "onesvd-git-"));
   const repoDir = path.join(tmp, "repo");
   try {
@@ -1012,7 +1074,7 @@ async function buildRunner(runner) {
     // capture the commit we're building. We DON'T advance runner.lastSha yet —
     // only after a successful build — so a failed/interrupted build retries on
     // the next poll instead of being silently skipped.
-    const sha = (spawnSync("git", ["-C", repoDir, "rev-parse", "HEAD"]).stdout || "").toString().trim();
+    sha = (spawnSync("git", ["-C", repoDir, "rev-parse", "HEAD"]).stdout || "").toString().trim();
 
     // config: repo's .onesvd.yml overrides the runner's stored defaults
     const cfg = readRepoConfig(repoDir);
@@ -1043,12 +1105,53 @@ async function buildRunner(runner) {
       .map((x) => String(x).trim().replace(/^\/+/, ""))
       .filter(Boolean);
 
-    // Require explicit instructions — never auto-build or auto-dump a repo. A
-    // build runs only when a command is given (GUI runner field, or `build:` in
-    // the repo's .onesvd.yml). With neither a build nor artifacts configured,
-    // there's nothing to do — fail clearly instead of guessing.
+    // Nothing to build and no artifacts named — drop the whole repo (minus .git)
+    // into a single folder named after the repo, e.g. base1/bitcoin/. This is
+    // the "just track this repo" mode; commit a .onesvd.yml to build and store
+    // specific outputs instead.
     if (!build && artifactList.length === 0) {
-      throw new Error("nothing to build or store — set a build command and/or artifacts on the runner, or add a .onesvd.yml to the repo");
+      const subName = repoNameFromUrl(runner.repo);        // e.g. "bitcoin"
+      const target = path.join(destAbs, subName);          // …/base1/bitcoin
+      const rel = dest ? dest + "/" + subName : subName;    // base1/bitcoin
+      gitMsg(id, "log", { line: `no build configured — storing the repo in /${rel}\n` });
+      appendRunnerLog(id, `no build configured — storing the repo (minus .git) at ${target}\n`);
+      runner.phase = "copying"; broadcastRunners();
+
+      // remove what this runner wrote last time, then copy the repo into its folder
+      for (const prev of runner.written || []) {
+        const p = path.resolve(ROOT, prev);
+        if (p.startsWith(ROOT + path.sep)) { try { fs.rmSync(p, { recursive: true, force: true }); } catch {} }
+      }
+      fs.mkdirSync(destAbs, { recursive: true });
+      const noGit = (s) => !s.split(path.sep).includes(".git");
+      fs.cpSync(repoDir, target, { recursive: true, filter: noGit });
+      const written = [rel];
+
+      // close the log with how to switch to a build-and-store setup
+      const guide =
+        `\nStored the repo at ${target}\n\n` +
+        `To build this repo and store only its outputs instead of the whole repo,\n` +
+        `commit a .onesvd.yml to the repo root, for example:\n\n` +
+        `  build: <command to build the repo>\n` +
+        `  artifacts: <path to the build outputs>\n` +
+        `  # submodules: true   # if the repo needs them\n\n` +
+        `Docs: https://onesvd.com/docs/guides/git-runners\n`;
+      gitMsg(id, "log", { line: guide });
+      appendRunnerLog(id, guide);
+
+      runner.dest = dest;
+      runner.written = written;
+      runner.lastSha = sha;
+      runner.lastBuilt = Date.now();
+      runner.status = "idle";
+      runner.error = null;
+      runner.phase = "done";
+      runner.buildStartedAt = null;
+      recordRun(runner, runId, "success", sha);
+      saveRunners();
+      broadcastRunners();
+      gitMsg(id, "done", { dest, sha: sha.slice(0, 7) });
+      return; // finally{} still cleans up the temp checkout
     }
 
     // Optional submodules (heavy) — opt in via the runner (GUI) or `submodules:
@@ -1129,6 +1232,7 @@ async function buildRunner(runner) {
     runner.error = null;
     runner.phase = "done";
     runner.buildStartedAt = null;
+    recordRun(runner, runId, "success", sha);
     saveRunners();
     broadcastRunners();
     gitMsg(id, "done", { dest, sha: sha.slice(0, 7) });
@@ -1138,6 +1242,7 @@ async function buildRunner(runner) {
     runner.phase = "error";
     runner.buildStartedAt = null;
     appendRunnerLog(id, `\n✕ ${runner.error}\n`); // keep the failure in the saved log
+    recordRun(runner, runId, "error", sha, runner.error);
     broadcastRunners();
     gitMsg(id, "error", { message: runner.error });
   } finally {
@@ -1262,7 +1367,9 @@ function handleAddRunner(req, res) {
       res.writeHead(400);
       return res.end("repo must be a GitHub/GitLab URL — SSH (git@github.com:owner/repo.git) or HTTPS for public repos (https://github.com/owner/repo.git)");
     }
-    const dest = opt.dest !== undefined ? safeRelPath(opt.dest) : safeName(repoNameFromUrl(repo));
+    // Destination is the folder the user is in when they add the runner (the
+    // frontend sends it, "" for the watch root). No repo-name subfolder default.
+    const dest = safeRelPath(opt.dest || "");
     const destAbs = dest === "" ? ROOT : path.resolve(ROOT, dest);
     if (destAbs !== ROOT && !destAbs.startsWith(ROOT + path.sep)) {
       res.writeHead(400);
@@ -1305,13 +1412,15 @@ function handleListRunners(req, res) {
   res.end(JSON.stringify({ runners: runners.map(publicRunner) }));
 }
 
-// GET /runners/logs?id= — the captured build log for one runner (latest build).
+// GET /runners/logs?id=&run= — a runner's build log. Without run=, the latest
+// (or live) build; with run=<runId>, that specific past run.
 function handleRunnerLogs(req, res) {
   const url = new URL(req.url, "http://localhost");
   const id = url.searchParams.get("id") || "";
+  const run = url.searchParams.get("run") || "";
   if (!id) { res.writeHead(400); return res.end("missing id"); }
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
-  res.end(readRunnerLog(id));
+  res.end(readRunnerLog(id, run || undefined));
 }
 
 function handleDeleteRunner(req, res) {
@@ -1400,6 +1509,7 @@ const requestHandler = (req, res) => {
       if (req.method === "POST" && req.url.startsWith("/upload/cancel")) return handleUploadCancel(req, res);
       if (req.method === "GET" && req.url.startsWith("/upload/status")) return handleUploadStatus(req, res);
       if (req.method === "POST" && req.url.startsWith("/upload")) return handleUpload(req, res);
+      if (req.method === "POST" && req.url.startsWith("/mkdir")) return handleMkdir(req, res);
       if (req.method === "POST" && req.url.startsWith("/delete")) return handleDelete(req, res);
       if (req.method === "POST" && req.url.startsWith("/runners/delete")) return handleDeleteRunner(req, res);
       if (req.method === "POST" && req.url.startsWith("/runners/build")) return handleBuildRunner(req, res);
@@ -1520,6 +1630,13 @@ if (hasGit) {
 // ensure the watched root exists (first run on a fresh machine has no dir yet)
 try { fs.mkdirSync(ROOT, { recursive: true }); console.log(`root: ${ROOT}`); }
 catch (e) { console.error(`root: could not create ${ROOT}:`, e.message); }
+
+// The hub writes runner artifacts into ROOT. If ONESVD_ROOT isn't set, ROOT is a
+// default that almost certainly isn't the directory the watcher is watching — so
+// artifacts would land somewhere invisible. Make that loud rather than silent.
+if (!process.env.ONESVD_ROOT) {
+  console.warn(`⚠ ONESVD_ROOT is not set — using default ${ROOT}. If that is not your watched directory, set ONESVD_ROOT to it (the same value as 'onesvd dir') or runner artifacts will land where the watcher can't see them.`);
+}
 
 // restore login sessions so a restart doesn't sign everyone out
 loadSessions();
