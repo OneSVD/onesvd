@@ -20,7 +20,7 @@ recompute its integrity hash — so you can verify exactly what shipped, down to
 Self-host a fully featured node on your own hardware (Ubuntu Linux):
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
 ```
 
 That's it — no license keys, no limits, and your data never leaves your machine.
@@ -51,7 +51,7 @@ step.
 
 ```bash
 # 1. Install the node
-curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
 
 # 2. Drop a file into the watched root — it's fingerprinted on arrival
 cp ./build.tar.gz "$ONESVD_ROOT/"
@@ -82,6 +82,47 @@ OneSVD is a single installable product made of three cooperating pieces:
 
 Override any port with its environment variable before installing. If a port is already in use by
 something other than OneSVD, the installer stops and tells you which one.
+
+## Windows installation (WSL2)
+
+OneSVD runs on Linux; on Windows, install it inside WSL2.
+
+1. **Install WSL2 with Ubuntu** — in an Administrator PowerShell, then reboot and set up your Ubuntu
+   user:
+
+   ```powershell
+   wsl --install
+   ```
+
+2. **Enable systemd** so OneSVD's services run. Inside Ubuntu, add to `/etc/wsl.conf`:
+
+   ```ini
+   [boot]
+   systemd=true
+   ```
+
+   then `wsl --shutdown` from PowerShell and reopen Ubuntu. (Recent WSL builds enable systemd by
+   default — run `systemctl` first; if it works, skip this step.)
+
+3. **Install OneSVD** inside Ubuntu, exactly as on a native node:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
+   ```
+
+4. Open `http://localhost:7777` in a Windows browser.
+
+## LAN access from WSL2
+
+If LAN devices can't reach OneSVD at `http://<host-ip>:7777`, Windows likely needs inbound firewall
+rules for the two ports. In an **Administrator** PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "OneSVD 7777" -Direction Inbound -LocalPort 7777 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "OneSVD 4000" -Direction Inbound -LocalPort 4000 -Protocol TCP -Action Allow
+```
+
+Both ports are needed — the UI loads from `7777` and then talks to the hub on `4000`.
 
 ## Documentation
 
