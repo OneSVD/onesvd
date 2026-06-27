@@ -20,7 +20,7 @@ recompute its integrity hash — so you can verify exactly what shipped, down to
 Self-host a fully featured node on your own hardware (Ubuntu Linux):
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | bash
 ```
 
 That's it — no license keys, no limits, and your data never leaves your machine.
@@ -51,10 +51,10 @@ step.
 
 ```bash
 # 1. Install the node
-curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | bash
 
 # 2. Drop a file into the watched root — it's fingerprinted on arrival
-cp ./build.tar.gz "$ONESVD_ROOT/"
+touch "$ONESVD_ROOT/test_file.txt"
 
 # 3. Open the web client to browse the tree
 open http://localhost:7777
@@ -107,7 +107,7 @@ OneSVD runs on Linux; on Windows, install it inside WSL2.
 3. **Install OneSVD** inside Ubuntu, exactly as on a native node:
 
    ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | sh
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.onesvd.com | bash
    ```
 
 4. Open `http://localhost:7777` in a Windows browser.
