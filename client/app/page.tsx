@@ -152,6 +152,57 @@ export default function HomePage() {
   const [denied, setDenied] = useState<"ip" | "token" | null>(null);
   const [resumable, setResumable] = useState<PersistedUpload[]>([]);
   const [graphOpen, setGraphOpen] = useState(false);
+
+  // ---- back/forward support: mirror the current directory + the graph modal in
+  // the URL (?dir=…&graph=1) so the browser's back/forward arrows move through
+  // them the way novice users expect ----
+  const navReady = useRef(false);
+  const navPushed = useRef(false);
+  const navUrl = (dir: string, graph: boolean) => {
+    const sp = new URLSearchParams();
+    if (dir && dir !== ".") sp.set("dir", dir);
+    if (graph) sp.set("graph", "1");
+    const qs = sp.toString();
+    return qs ? `?${qs}` : window.location.pathname;
+  };
+  const navMatches = (dir: string, graph: boolean) => {
+    const sp = new URLSearchParams(window.location.search);
+    return (sp.get("dir") || ".") === (dir || ".") && (sp.get("graph") === "1") === graph;
+  };
+  // hydrate state from the URL once (deep links / refresh)
+  useEffect(() => {
+    const sp = new URLSearchParams(window.location.search);
+    const dir = sp.get("dir") || ".";
+    const graph = sp.get("graph") === "1";
+    setCwd(dir);
+    setGraphOpen(graph);
+    window.history.replaceState({ dir, graph }, "", navUrl(dir, graph));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // state → URL: push a new entry for genuine changes (skip the first/redundant/restored ones)
+  useEffect(() => {
+    if (!navReady.current) { navReady.current = true; return; }
+    if (typeof window === "undefined" || navMatches(cwd, graphOpen)) return;
+    window.history.pushState({ dir: cwd, graph: graphOpen }, "", navUrl(cwd, graphOpen));
+    navPushed.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cwd, graphOpen]);
+  // URL → state on back/forward
+  useEffect(() => {
+    const onPop = () => {
+      const sp = new URLSearchParams(window.location.search);
+      setCwd(sp.get("dir") || ".");
+      setGraphOpen(sp.get("graph") === "1");
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+  // close the graph by popping its own history entry when we pushed it (keeps the
+  // history stack tidy: back then lands on the directory, not a re-opened graph)
+  const closeGraph = () => {
+    if (typeof window !== "undefined" && navPushed.current && window.history.state?.graph) window.history.back();
+    else setGraphOpen(false);
+  };
   const [tokenModal, setTokenModal] = useState(false);
   const [tokenDraft, setTokenDraft] = useState("");
   const runnerByPath = useMemo(() => {
@@ -622,9 +673,24 @@ export default function HomePage() {
     pushToast(ok ? "Link copied" : "Couldn't copy link", ok ? "done" : "error");
   };
 
+  // git runners "managed by" a directory: those that build into it (destination
+  // at or below the path) or have written artifacts inside it. Deleting the
+  // folder should take these runners with it so they don't keep rebuilding a
+  // destination that no longer exists.
+  const runnersForPath = (dirPath: string): RunnerInfo[] => {
+    const within = (p: string) => p === dirPath || p.startsWith(dirPath + "/");
+    return runners.filter((r) => {
+      const dest = r.dest && r.dest !== "." ? r.dest : "";
+      if (dest && within(dest)) return true;
+      return (r.written || []).some((w) => within(w));
+    });
+  };
+
   const doDelete = async () => {
     if (!confirmDelete) return;
-    const { path, name } = confirmDelete;
+    const { path, name, type } = confirmDelete;
+    // git runners that live in this folder are removed along with it
+    const affectedRunners = type === "directory" ? runnersForPath(path) : [];
     setConfirmDelete(null);
     // optimistic: hide the row right away
     setRemoving((s) => new Set(s).add(path));
@@ -633,7 +699,15 @@ export default function HomePage() {
       const res = await fetch(`${DELETE_URL}?path=${encodeURIComponent(path)}`, { method: "POST", headers: authHeaders() });
       if (res.status === 401) { restore(); setTokenModal(true); pushToast("Auth required to delete", "error"); return; }
       if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
-      pushToast(`Deleted ${name}`, "done");
+      // the folder is gone — remove any runners that built into it so the next
+      // poll can't rebuild a deleted destination
+      for (const r of affectedRunners) removeRunner(r.id);
+      pushToast(
+        affectedRunners.length
+          ? `Deleted ${name} · removed ${affectedRunners.length} runner${affectedRunners.length === 1 ? "" : "s"}`
+          : `Deleted ${name}`,
+        "done"
+      );
       // safety net: if no patch confirms the removal, stop hiding it
       setTimeout(restore, 15000);
     } catch (e: any) {
@@ -1346,7 +1420,7 @@ export default function HomePage() {
       )}
 
       {graphOpen && tree && (
-        <div className="modal-backdrop modal-backdrop--graph" onClick={() => setGraphOpen(false)}>
+        <div className="modal-backdrop modal-backdrop--graph" onClick={closeGraph}>
           <div className="modal modal--graph" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
             <MerkleGraph
               tree={tree}
@@ -1354,7 +1428,7 @@ export default function HomePage() {
               removing={removing}
               onCopy={async (h) => { const ok = await copyTextToClipboard(h); pushToast(ok ? "Hash copied" : "Couldn't copy hash", ok ? "done" : "error"); }}
               onCopyRoot={async () => { const ok = await copyTextToClipboard(tree.sha256); pushToast(ok ? "Root hash copied" : "Couldn't copy hash", ok ? "done" : "error"); }}
-              onClose={() => setGraphOpen(false)}
+              onClose={closeGraph}
               onCopyLink={(p, t) => copyLink(p, t)}
               onDownload={(node) => { window.location.href = node.type === "file" ? downloadUrl(node.path) : zipUrl(node.path); }}
               onDelete={(node) => setConfirmDelete({ path: node.path, name: node.name, type: node.type })}
@@ -1363,7 +1437,9 @@ export default function HomePage() {
         </div>
       )}
 
-      {confirmDelete && (
+      {confirmDelete && (() => {
+        const affected = confirmDelete.type === "directory" ? runnersForPath(confirmDelete.path) : [];
+        return (
         <div className="modal-backdrop" onClick={() => setConfirmDelete(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
             <div className="modal-head">
@@ -1374,13 +1450,19 @@ export default function HomePage() {
               Delete <strong>{confirmDelete.name}</strong>
               {confirmDelete.type === "directory" ? " and everything inside it" : ""}? This can't be undone.
             </p>
+            {affected.length > 0 && (
+              <p className="modal-text modal-text--warn">
+                {affected.length === 1 ? "A git runner builds" : `${affected.length} git runners build`} into this folder — {affected.length === 1 ? "it" : "they"} will be removed too.
+              </p>
+            )}
             <div className="modal-actions">
               <button className="mbtn mbtn--ghost" onClick={() => setConfirmDelete(null)}>Cancel</button>
               <button className="mbtn mbtn--danger" onClick={doDelete}>Delete</button>
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {gitModal && (() => {
         const selected = runners.find((r) => r.id === selectedRunnerId) || null;
@@ -1672,10 +1754,6 @@ artifacts: dist
 // ── Merkle graph viewer ──────────────────────────────────────────────────────
 // A self-contained animated SVG of the tree: directories/files as nodes, hashes
 // shown, parent→child links drawing in. No external deps. Layered left→right.
-type GNode = {
-  key: string; name: string; type: "file" | "directory"; sha: string;
-  depth: number; x: number; y: number; parent?: string;
-};
 function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, onDelete, onCopyRoot, onClose }: {
   tree: TreeNode; version: number;
   removing: Set<string>;
@@ -1686,20 +1764,41 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
   onCopyRoot: () => void;
   onClose: () => void;
 }) {
-  const ROW = 34, COL = 200, R = 7, MAX_NODES = 240;
+  type GNode = { key: string; name: string; type: "file" | "directory"; sha: string; depth: number; x: number; y: number; size: number; parent?: string; more?: number; hasKids?: boolean; collapsed?: boolean; kidCount?: number };
+  const LV = 72, GAP = 150, R = 7; // GAP widened so horizontal labels don't overlap
+  const CHILD_CAP = 120;            // max children drawn per expanded folder before a "+N more"
+  const MAX_NODES = 4000;           // hard safety guard
+  const ANIM_CAP = 160;
   const DUP_COLORS = ["#FF6B6B", "#FFA94D", "#FFD43B", "#A88BFA", "#4DABF7", "#38D9A9", "#F783AC", "#9CC2FF", "#E599F7", "#63E6BE"];
   const prevShas = useRef<Map<string, string>>(new Map());
 
-  const { nodes, edges, width, height, changed, dupColor, dupGroups } = useMemo(() => {
-    const nodes: GNode[] = [];
-    const edges: { from: GNode; to: GNode }[] = [];
-    let leaf = 0, count = 0, truncated = false;
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setReady(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
 
-    // ── duplicate detection over the WHOLE tree (files only) ─────────────────
-    // identical sha256 = identical content. Group files by hash; any hash with
-    // 2+ files is a duplicate set wasting (n-1)×size bytes.
-    type DupAcc = { hash: string; paths: string[]; size: number };
-    const byHash = new Map<string, DupAcc>();
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set<string>(["."])); // root open → first level shown
+  const [fullyShown, setFullyShown] = useState<Set<string>>(new Set());                 // folders shown past the cap
+  const [view, setView] = useState({ z: 1, tx: 0, ty: 0 });
+  const [selectedDup, setSelectedDup] = useState<string | null>(null);
+  const [hoveredDup, setHoveredDup] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [picked, setPicked] = useState<{ node: GNode; sx: number; sy: number } | null>(null);
+  const [dupPage, setDupPage] = useState(0);
+  const [boxH, setBoxH] = useState(0);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const q = query.trim().toLowerCase();
+
+  const toggle = (key: string) =>
+    setExpanded((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
+
+  // duplicate detection over the whole tree (independent of what's expanded)
+  const dups = useMemo(() => {
+    if (!ready) return null;
+    const byHash = new Map<string, { hash: string; paths: string[]; size: number }>();
     const collect = (node: TreeNode) => {
       if (node.type === "file" && node.sha256) {
         const acc = byHash.get(node.sha256) || { hash: node.sha256, paths: [], size: node.size || 0 };
@@ -1710,115 +1809,125 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
       for (const c of node.children || []) collect(c);
     };
     collect(tree);
-    const dupGroups = [...byHash.values()]
+    const groups = [...byHash.values()]
       .filter((g) => g.paths.length > 1)
       .map((g) => ({ ...g, copies: g.paths.length, wasted: (g.paths.length - 1) * g.size }))
       .sort((a, b) => b.wasted - a.wasted || b.copies - a.copies);
-    const dupColor = new Map<string, string>();
-    dupGroups.forEach((g, i) => dupColor.set(g.hash, DUP_COLORS[i % DUP_COLORS.length]));
+    const color = new Map<string, string>();
+    groups.forEach((g, i) => color.set(g.hash, DUP_COLORS[i % DUP_COLORS.length]));
+    return { groups, color };
+  }, [ready, tree, version]);
+  const dupColor = dups?.color ?? null;
+  const dupGroups = dups?.groups ?? [];
 
-    // recursive layout: y from leaf order, internal nodes centered on children
-    const walk = (node: TreeNode, depth: number, parentKey?: string): GNode | null => {
-      if (count >= MAX_NODES) { truncated = true; return null; }
-      count++;
+  // search the whole tree → matches + the ancestor paths needed to reveal them
+  const search = useMemo(() => {
+    if (!q) return null;
+    const matches = new Set<string>();
+    const relevant = new Set<string>();
+    const walk = (node: TreeNode): boolean => {
+      const path = node.path || ".";
+      const self = (node.name || "").toLowerCase().includes(q) || (node.sha256 || "").toLowerCase().includes(q);
+      let child = false;
+      for (const c of node.children || []) if (walk(c)) child = true;
+      if (self) matches.add(path);
+      if (self || child) relevant.add(path);
+      return self || child;
+    };
+    walk(tree);
+    return { matches, relevant };
+  }, [q, tree, version]);
+
+  // layout: only render root + expanded subtrees. Children stay in received (hash)
+  // order — never re-sorted — so left-to-right IS the order they're hashed.
+  const built = useMemo(() => {
+    if (!ready) return null;
+    const nodes: GNode[] = [];
+    const edges: { from: GNode; to: GNode }[] = [];
+    let leafX = 0, count = 0;
+
+    const walk = (node: TreeNode, depth: number, parentKey?: string): GNode => {
       const key = node.path || ".";
-      const g: GNode = { key, name: node.name || "root", type: node.type, sha: node.sha256 || "", depth, x: depth * COL + 40, y: 0, parent: parentKey };
-      nodes.push(g);
-      const kids = node.children && node.children.length ? [...node.children].sort(
-        (a, b) => (a.type !== b.type ? (a.type === "directory" ? -1 : 1) : a.name.localeCompare(b.name))
-      ) : [];
-      if (!kids.length) { g.y = leaf++ * ROW + 28; }
-      else {
+      const isDir = node.type === "directory";
+      const kids = node.children || [];
+      const hasKids = isDir && kids.length > 0;
+      const open = search ? search.relevant.has(key) : expanded.has(key);
+      const g: GNode = { key, name: node.name || "root", type: node.type, sha: node.sha256 || "", depth, x: 0, y: depth * LV + 50, size: node.size || 0, parent: parentKey, hasKids, collapsed: hasKids && !open, kidCount: kids.length };
+      nodes.push(g); count++;
+      if (hasKids && open && count < MAX_NODES) {
+        const visKids = search ? kids.filter((k) => search.relevant.has(k.path)) : kids;
+        const cap = (search || fullyShown.has(key)) ? visKids.length : Math.min(visKids.length, CHILD_CAP);
         const childGs: GNode[] = [];
-        for (const k of kids) { const cg = walk(k, depth + 1, key); if (cg) { childGs.push(cg); edges.push({ from: g, to: cg }); } }
-        g.y = childGs.length ? (childGs[0].y + childGs[childGs.length - 1].y) / 2 : leaf++ * ROW + 28;
+        for (let i = 0; i < cap && count < MAX_NODES; i++) {
+          const cg = walk(visKids[i], depth + 1, key);
+          childGs.push(cg); edges.push({ from: g, to: cg });
+        }
+        const moreN = visKids.length - childGs.length;
+        if (moreN > 0) {
+          const mg: GNode = { key: `${key}\u0000more`, name: `+${moreN} more`, type: "file", sha: "", depth: depth + 1, x: leafX++ * GAP + 40, y: (depth + 1) * LV + 50, parent: key, more: moreN, size: 0 };
+          nodes.push(mg); childGs.push(mg); edges.push({ from: g, to: mg });
+        }
+        g.x = childGs.length ? (childGs[0].x + childGs[childGs.length - 1].x) / 2 : leafX++ * GAP + 40;
+      } else {
+        g.x = leafX++ * GAP + 40;
       }
       return g;
     };
     walk(tree, 0);
 
-    // which nodes changed hash since last render → pulse them
     const changed = new Set<string>();
-    for (const n of nodes) { const p = prevShas.current.get(n.key); if (p !== undefined && p !== n.sha) changed.add(n.key); }
-    const next = new Map<string, string>(); for (const n of nodes) next.set(n.key, n.sha);
+    for (const n of nodes) { if (!n.sha) continue; const p = prevShas.current.get(n.key); if (p !== undefined && p !== n.sha) changed.add(n.key); }
+    const next = new Map<string, string>(); for (const n of nodes) if (n.sha) next.set(n.key, n.sha);
     prevShas.current = next;
 
     const maxDepth = nodes.reduce((m, n) => Math.max(m, n.depth), 0);
-    const width = (maxDepth + 1) * COL + 80;
-    const height = Math.max(leaf, 1) * ROW + 40;
-    if (truncated) nodes.push({ key: "__more__", name: `… ${MAX_NODES}+ nodes (truncated)`, type: "file", sha: "", depth: 0, x: 40, y: height - 6, parent: undefined });
-    return { nodes, edges, width, height, changed, dupColor, dupGroups };
-  }, [tree, version]);
+    const width = leafX * GAP + 80;
+    const height = (maxDepth + 1) * LV + 60;
+    return { nodes, edges, width, height, changed };
+  }, [ready, tree, version, expanded, fullyShown, search]);
 
-  // transform-based pan/zoom: a <g> carries translate + scale over a fill-the-box SVG
-  const [view, setView] = useState({ z: 1, tx: 0, ty: 0 });
-  const [selectedDup, setSelectedDup] = useState<string | null>(null);
-  const [hoveredDup, setHoveredDup] = useState<string | null>(null);
-  const [query, setQuery] = useState("");
-  const [picked, setPicked] = useState<{ node: GNode; sx: number; sy: number } | null>(null);
-  const boxRef = useRef<HTMLDivElement>(null);
-  const viewRef = useRef(view);
-  viewRef.current = view;
-  const q = query.trim().toLowerCase();
-  const matchSet = useMemo(() => {
-    if (!q) return null;
-    const s = new Set<string>();
-    for (const n of nodes) {
-      if (n.key === "__more__") continue;
-      if (n.name.toLowerCase().includes(q) || n.sha.toLowerCase().includes(q)) s.add(n.key);
-    }
-    return s;
-  }, [q, nodes]);
-  const matchCount = matchSet ? matchSet.size : 0;
+  const { nodes, edges, width, height, changed } = built ?? { nodes: [] as GNode[], edges: [] as { from: GNode; to: GNode }[], width: 0, height: 0, changed: new Set<string>() };
+  const animate = nodes.length <= ANIM_CAP;
+  const matchCount = search ? search.matches.size : 0;
+  const focusHash = hoveredDup ?? selectedDup;
 
-  const clampZoom = (z: number) => Math.min(4, Math.max(0.1, z));
-
+  const clampZoom = (z: number) => Math.min(5, Math.max(0.1, z));
   const fitView = () => {
     const el = boxRef.current;
-    if (!el) return;
+    if (!el || !width || !height) return;
     const cw = el.clientWidth, ch = el.clientHeight;
-    const z = clampZoom(Math.min((cw - 32) / width, (ch - 32) / height));
-    setView({ z, tx: (cw - width * z) / 2, ty: (ch - height * z) / 2 });
+    const z = Math.min(5, Math.max(0.2, Math.min((cw - 32) / width, (ch - 32) / height)));
+    setView({ z, tx: (cw - width * z) / 2, ty: Math.max(16, (ch - height * z) / 2) });
   };
-  // fit when the graph opens or its content size changes
   useEffect(() => { fitView(); /* eslint-disable-next-line */ }, [width, height]);
-  // close the node popover whenever the view moves (so it can't float out of place)
   useEffect(() => { setPicked(null); }, [view.tx, view.ty, view.z]);
 
-  // zoom around a container-relative point (keeps that point fixed under the cursor)
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setBoxH(el.clientHeight));
+    ro.observe(el); setBoxH(el.clientHeight);
+    return () => ro.disconnect();
+  }, []);
+
   const zoomAt = (cx: number, cy: number, factor: number) => {
     const { z, tx, ty } = viewRef.current;
     const nz = clampZoom(z * factor);
     const k = nz / z;
     setView({ z: nz, tx: cx - (cx - tx) * k, ty: cy - (cy - ty) * k });
   };
-  const zoomCenter = (factor: number) => {
-    const el = boxRef.current;
-    if (!el) return;
-    zoomAt(el.clientWidth / 2, el.clientHeight / 2, factor);
-  };
+  const zoomCenter = (factor: number) => { const el = boxRef.current; if (!el) return; zoomAt(el.clientWidth / 2, el.clientHeight / 2, factor); };
 
-  // wheel zoom (no modifier) toward cursor + drag to pan
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const r = el.getBoundingClientRect();
-      zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.12 : 1 / 1.12);
-    };
+    const onWheel = (e: WheelEvent) => { e.preventDefault(); const r = el.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.12 : 1 / 1.12); };
     let down = false, dragging = false, sx = 0, sy = 0, btx = 0, bty = 0;
-    const onDown = (e: PointerEvent) => {
-      down = true; dragging = false; sx = e.clientX; sy = e.clientY;
-      btx = viewRef.current.tx; bty = viewRef.current.ty;
-    };
+    const onDown = (e: PointerEvent) => { down = true; dragging = false; sx = e.clientX; sy = e.clientY; btx = viewRef.current.tx; bty = viewRef.current.ty; };
     const onMove = (e: PointerEvent) => {
       if (!down) return;
       const dx = e.clientX - sx, dy = e.clientY - sy;
-      if (!dragging && Math.abs(dx) + Math.abs(dy) > 4) {
-        dragging = true; el.classList.add("is-panning");
-        el.setPointerCapture?.(e.pointerId); // capture only once a real drag starts
-      }
+      if (!dragging && Math.abs(dx) + Math.abs(dy) > 4) { dragging = true; el.classList.add("is-panning"); el.setPointerCapture?.(e.pointerId); }
       if (dragging) setView((v) => ({ ...v, tx: btx + dx, ty: bty + dy }));
     };
     const onUp = () => { down = false; dragging = false; el.classList.remove("is-panning"); };
@@ -1834,14 +1943,18 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
     };
   }, []);
 
+  const perPage = Math.max(4, Math.floor((boxH - 124) / 48) || 8);
+  const pageCount = Math.max(1, Math.ceil(dupGroups.length / perPage));
+  const page = Math.min(dupPage, pageCount - 1);
+  const pageItems = dupGroups.slice(page * perPage, page * perPage + perPage);
+
+  // shorthand long names but keep the tail (e.g. "(18)") so siblings stay distinct
+  const shortName = (s: string) => (s.length > 20 ? `${s.slice(0, 10)}…${s.slice(-8)}` : s);
+
   return (
     <>
       <div className="graph-zoom">
-        <button
-          className="graph-roothash"
-          title={`root ${tree.sha256} — click to copy`}
-          onClick={onCopyRoot}
-        >
+        <button className="graph-roothash" title={`root ${tree.sha256} — click to copy`} onClick={onCopyRoot}>
           <span className="graph-roothash-k">root</span>
           <span className="graph-roothash-v">{shortHash(tree.sha256)}</span>
           <span className="graph-roothash-ic" aria-hidden>{CopyIcon}</span>
@@ -1852,64 +1965,64 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
         <button className="graph-zbtn" onClick={() => zoomCenter(1.25)} aria-label="Zoom in" title="Zoom in">+</button>
         <button className="graph-zfit" onClick={fitView} title="Fit to view">Fit</button>
         <div className="graph-search">
-          <input
-            className="graph-search-in"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="search name or hash…"
-            spellCheck={false}
-          />
+          <input className="graph-search-in" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="search name or hash…" spellCheck={false} />
           {query && <button className="graph-search-x" onClick={() => setQuery("")} aria-label="Clear search">{Cross}</button>}
           {q && <span className="graph-search-n">{matchCount} match{matchCount === 1 ? "" : "es"}</span>}
         </div>
         <button className="modal-close graph-close" aria-label="Close" onClick={onClose}>{Cross}</button>
       </div>
+
       <div className="graph-scroll" ref={boxRef}>
-        <svg className="graph-svg" width="100%" height="100%">
-          <defs>
-            <linearGradient id="edgeg" x1="0" y1="0" x2="1" y2="0">
-              <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.15" />
-              <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.6" />
-            </linearGradient>
-          </defs>
-          <g transform={`translate(${view.tx} ${view.ty}) scale(${view.z})`} className={(matchSet || hoveredDup || selectedDup) ? "is-spotlight" : ""}>
-            {edges.map((e, i) => {
-              const x1 = e.from.x + R, y1 = e.from.y, x2 = e.to.x - R, y2 = e.to.y, mx = (x1 + x2) / 2;
-              const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
-              return <path key={i} className="graph-edge" d={d} pathLength={1} style={{ animationDelay: `${e.to.depth * 80}ms` }} />;
-            })}
-            {nodes.map((n) => {
-              if (n.key === "__more__") return <text key={n.key} className="graph-more" x={n.x} y={n.y}>{n.name}</text>;
-              const isRoot = n.key === ".";
-              const dc = n.sha ? dupColor.get(n.sha) : undefined;
-              const isRemoving = removing.has(n.key) || [...removing].some((p) => n.key === p || n.key.startsWith(p + "/"));
-              // search takes precedence; otherwise fall back to duplicate hover/selection
-              let isFocus: boolean, dimmed: boolean;
-              if (matchSet) { isFocus = matchSet.has(n.key); dimmed = !isFocus; }
-              else { const f = hoveredDup ?? selectedDup; isFocus = f !== null && n.sha === f; dimmed = f !== null && !isFocus; }
-              const cls = `graph-node ${n.type === "directory" ? "is-dir" : "is-file"}${isRoot ? " is-root" : ""}${changed.has(n.key) ? " is-changed" : ""}${dc ? " is-dup" : ""}${dimmed ? " is-dim" : ""}${isFocus ? " is-focus" : ""}${matchSet && isFocus ? " is-match" : ""}${isRemoving ? " is-removing" : ""}`;
-              return (
-                <g key={n.key} className={cls} style={{ animationDelay: `${n.depth * 80 + 40}ms` }}
-                   onClick={(ev) => {
-                     ev.stopPropagation();
-                     const el = boxRef.current; if (!el) return;
-                     // node content coords → container-relative pixels (popover lives inside the box)
-                     const px = view.tx + n.x * view.z;
-                     const py = view.ty + n.y * view.z;
-                     setPicked({ node: n, sx: px, sy: py });
-                   }} role="button">
-                  {dc && <circle className="dup-ring" cx={n.x} cy={n.y} r={R + 4} fill="none" stroke={dc} strokeWidth={2.5} />}
-                  {n.type === "directory"
-                    ? <rect x={n.x - R} y={n.y - R} width={R * 2} height={R * 2} rx="3" transform={`rotate(45 ${n.x} ${n.y})`}
-                            style={dc ? { stroke: dc } : undefined} />
-                    : <circle cx={n.x} cy={n.y} r={R} style={dc ? { stroke: dc } : undefined} />}
-                  <text className={`graph-name${isRemoving ? " is-strike" : ""}`} x={n.x + R + 7} y={n.y - 2}>{n.name}</text>
-                  <text className="graph-hash" x={n.x + R + 7} y={n.y + 9}>{isRemoving ? "deleting…" : (n.sha ? n.sha.slice(0, 10) : "—")}</text>
-                </g>
-              );
-            })}
-          </g>
-        </svg>
+        {!ready ? (
+          <div className="graph-loading"><span className="graph-spinner" aria-hidden /><span>Building graph…</span></div>
+        ) : (
+          <svg className="graph-svg" width="100%" height="100%">
+            <g transform={`translate(${view.tx} ${view.ty}) scale(${view.z})`}
+               className={`${(search || focusHash) ? "is-spotlight" : ""}${animate ? "" : " no-anim"}`}>
+              {edges.map((e, i) => {
+                const x1 = e.from.x, y1 = e.from.y + R, x2 = e.to.x, y2 = e.to.y - R, my = (y1 + y2) / 2;
+                const d = `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`;
+                return <path key={i} className="graph-edge" d={d} pathLength={1} style={animate ? { animationDelay: `${e.to.depth * 60}ms` } : undefined} />;
+              })}
+              {nodes.map((n) => {
+                if (n.more) {
+                  return (
+                    <g key={n.key} className="bubble is-more" role="button"
+                       onClick={(ev) => { ev.stopPropagation(); if (n.parent) setFullyShown((s) => new Set(s).add(n.parent!)); }}>
+                      <title>show {n.more} more children</title>
+                      <circle cx={n.x} cy={n.y} r={R - 1} />
+                      <text className="bubble-label" x={n.x + R + 6} y={n.y + 3}>{n.name}</text>
+                    </g>
+                  );
+                }
+                const isRoot = n.key === ".";
+                const isDir = n.type === "directory";
+                const dc = !isDir && n.sha ? dupColor?.get(n.sha) : undefined;
+                const isRemoving = removing.has(n.key) || [...removing].some((p) => n.key === p || n.key.startsWith(p + "/"));
+                let isFocus: boolean, dimmed: boolean;
+                if (search) { isFocus = search.matches.has(n.key); dimmed = !isFocus; }
+                else if (focusHash) { isFocus = n.sha === focusHash; dimmed = !isFocus; }
+                else { isFocus = false; dimmed = false; }
+                const label = shortName(isRoot ? "root" : n.name);
+                const cls = `bubble ${isDir ? "is-dir" : "is-file"}${isRoot ? " is-root" : ""}${n.collapsed ? " is-collapsed" : ""}${changed.has(n.key) ? " is-changed" : ""}${dc ? " is-dup" : ""}${dimmed ? " is-dim" : ""}${isFocus ? " is-focus" : ""}${search && isFocus ? " is-match" : ""}${isRemoving ? " is-removing" : ""}`;
+                return (
+                  <g key={n.key} className={cls} style={animate ? { animationDelay: `${n.depth * 60 + 30}ms` } : undefined}
+                     onClick={(ev) => {
+                       ev.stopPropagation();
+                       if (n.hasKids) { toggle(n.key); return; }   // folder → expand / collapse
+                       setPicked({ node: n, sx: view.tx + n.x * view.z, sy: view.ty + n.y * view.z }); // leaf → actions
+                     }} role="button">
+                    <title>{isRoot ? "root" : n.name}{n.collapsed ? ` — ${n.kidCount} items, click to expand` : ""}</title>
+                    <circle cx={n.x} cy={n.y} r={R} style={dc ? { fill: dc, fillOpacity: 0.55, stroke: dc } : undefined} />
+                    {n.collapsed && <text className="bubble-plus" x={n.x} y={n.y + 0.5}>+</text>}
+                    <text className={`bubble-label${isRemoving ? " is-strike" : ""}`} x={n.x + R + 6} y={n.y - 1}>{label}</text>
+                    {n.sha && <text className="bubble-hash" x={n.x + R + 6} y={n.y + 10}>{n.sha.slice(0, 10)}</text>}
+                  </g>
+                );
+              })}
+            </g>
+          </svg>
+        )}
 
         {dupGroups.length > 0 && (
           <div className="dup-legend">
@@ -1920,35 +2033,39 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
               </span>
             </div>
             <div className="dup-legend-list">
-              {dupGroups.map((g, i) => {
-                const color = dupColor.get(g.hash)!;
+              {pageItems.map((g, i) => {
+                const idx = page * perPage + i;
+                const color = dupColor!.get(g.hash)!;
                 const active = selectedDup === g.hash;
                 return (
-                  <button
-                    key={g.hash}
-                    className={`dup-item${active ? " is-active" : ""}`}
-                    onClick={() => setSelectedDup(active ? null : g.hash)}
-                    onMouseEnter={() => setHoveredDup(g.hash)}
-                    onMouseLeave={() => setHoveredDup(null)}
-                    title={g.paths.join("\n")}
-                  >
-                    <span className="dup-swatch" style={{ background: color }}>{i + 1}</span>
+                  <button key={g.hash} className={`dup-item${active ? " is-active" : ""}`}
+                          onClick={() => setSelectedDup(active ? null : g.hash)}
+                          onMouseEnter={() => setHoveredDup(g.hash)}
+                          onMouseLeave={() => setHoveredDup(null)}
+                          title={g.paths.join("\n")}>
+                    <span className="dup-swatch" style={{ background: color }}>{idx + 1}</span>
                     <span className="dup-info">
-                      <span className="dup-line1">{g.copies}× copies · {formatBytes(g.size)} each</span>
+                      <span className="dup-line1">{g.copies}× · {formatBytes(g.size)} each</span>
                       <span className="dup-line2">{g.hash.slice(0, 12)} · {formatBytes(g.wasted)} wasted</span>
                     </span>
                   </button>
                 );
               })}
             </div>
-            {selectedDup && <div className="dup-legend-clear" onClick={() => setSelectedDup(null)}>clear highlight</div>}
+            {pageCount > 1 && (
+              <div className="dup-legend-pager">
+                <button className="dup-pg-btn" disabled={page === 0} onClick={() => setDupPage(page - 1)} aria-label="Previous page">‹</button>
+                <span className="dup-pg-info">{page * perPage + 1}–{Math.min((page + 1) * perPage, dupGroups.length)} of {dupGroups.length}</span>
+                <button className="dup-pg-btn" disabled={page >= pageCount - 1} onClick={() => setDupPage(page + 1)} aria-label="Next page">›</button>
+              </div>
+            )}
           </div>
         )}
 
-        {picked && picked.node.key !== "__more__" && (() => {
+        {picked && (() => {
           const el = boxRef.current;
           const cw = el?.clientWidth ?? 0, ch = el?.clientHeight ?? 0;
-          const PW = 170, PH = 80; // approx popover footprint for clamping
+          const PW = 170, PH = 80;
           const left = Math.max(8, Math.min(picked.sx, cw - PW - 8));
           const above = picked.sy > PH + 16;
           const top = above ? Math.max(8, picked.sy - PH - 12) : Math.min(ch - PH - 8, picked.sy + 16);
@@ -1956,29 +2073,16 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
             <>
               <div className="node-pop-scrim" onClick={() => setPicked(null)} />
               <div className="node-pop" style={{ left, top }} onClick={(e) => e.stopPropagation()}>
-                <div className="node-pop-name" title={picked.node.key === "." ? "root" : picked.node.key}>
-                  {picked.node.key === "." ? "root" : picked.node.name}
-                </div>
+                <div className="node-pop-name" title={picked.node.key}>{picked.node.name}</div>
                 <div className="node-pop-acts">
-                  {picked.node.key !== "." && (
-                    <button className="node-pop-btn node-pop-danger" title="Delete"
-                            onClick={() => { onDelete({ path: picked.node.key, name: picked.node.name, type: picked.node.type }); setPicked(null); }}>
-                      {Trash}
-                    </button>
-                  )}
+                  <button className="node-pop-btn node-pop-danger" title="Delete"
+                          onClick={() => { onDelete({ path: picked.node.key, name: picked.node.name, type: picked.node.type }); setPicked(null); }}>{Trash}</button>
                   <button className="node-pop-btn" title={picked.node.type === "directory" ? "Copy zip link" : "Copy link"}
-                          onClick={() => { onCopyLink(picked.node.key, picked.node.type); setPicked(null); }}>
-                    {LinkIcon}
-                  </button>
+                          onClick={() => { onCopyLink(picked.node.key, picked.node.type); setPicked(null); }}>{LinkIcon}</button>
                   <button className="node-pop-btn" title={picked.node.type === "file" ? "Download" : "Download as zip"}
-                          onClick={() => { onDownload({ path: picked.node.key, name: picked.node.name, type: picked.node.type }); setPicked(null); }}>
-                    {Download}
-                  </button>
+                          onClick={() => { onDownload({ path: picked.node.key, name: picked.node.name, type: picked.node.type }); setPicked(null); }}>{Download}</button>
                   <button className="node-pop-btn" title="Copy hash"
-                          onClick={() => { picked.node.sha && onCopy(picked.node.sha); setPicked(null); }}>
-                    <svg viewBox="0 0 16 16" width="14" height="14"><rect x="4.5" y="4.5" width="7" height="7" rx="1.5"
-                      transform="rotate(45 8 8)" fill="none" stroke="currentColor" strokeWidth="1.4" /></svg>
-                  </button>
+                          onClick={() => { picked.node.sha && onCopy(picked.node.sha); setPicked(null); }}>{CopyIcon}</button>
                 </div>
               </div>
             </>
@@ -1988,7 +2092,6 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
     </>
   );
 }
-
 
 const DiamondLg = (
   <svg viewBox="0 0 40 40" width="40" height="40" className="mtree" aria-hidden>
@@ -2345,6 +2448,17 @@ function count(n: TreeNode): { files: number; dirs: number; bytes: number } {
   }
   return { files, dirs, bytes };
 }
+// Match the Go worker's child ordering exactly: it hashes children in
+// sort.Strings order — a byte-wise (UTF-8) comparison of the names, NOT locale
+// order. Keeping the maintained tree in this order means the graph's left-to-right
+// layout is the true order each child folds into its parent's hash.
+const _nameEnc = new TextEncoder();
+function byHashOrder(a: TreeNode, b: TreeNode): number {
+  const ab = _nameEnc.encode(a.name), bb = _nameEnc.encode(b.name);
+  const n = Math.min(ab.length, bb.length);
+  for (let i = 0; i < n; i++) if (ab[i] !== bb[i]) return ab[i] - bb[i];
+  return ab.length - bb.length;
+}
 function applyPatch(root: TreeNode, changes: Change[]): TreeNode {
   let next = root;
   for (const c of changes) {
@@ -2370,7 +2484,7 @@ function edit(node: TreeNode, parts: string[], c: Change, consumed: number): Tre
         size: c.size, children: i !== -1 ? children[i].children : c.type === "directory" ? [] : undefined,
       };
       if (i !== -1) children[i] = updated; else children.push(updated);
-      children.sort((a, b) => a.name.localeCompare(b.name));
+      children.sort(byHashOrder);
     }
   } else {
     // descend; if an intermediate folder doesn't exist yet, create it so a
@@ -2384,7 +2498,7 @@ function edit(node: TreeNode, parts: string[], c: Change, consumed: number): Tre
       const parentPath = c.path.split("/").slice(0, consumed + 1).join("/");
       child = { name: head, path: parentPath, type: "directory", sha256: "", children: [] };
       children.push(child);
-      children.sort((a, b) => a.name.localeCompare(b.name));
+      children.sort(byHashOrder);
     }
     const idx = children.findIndex((ch) => ch.name === head);
     children[idx] = edit(child, rest, c, consumed + 1);
@@ -2572,189 +2686,106 @@ const CSS = `
 .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .modal-title { font-size: 14px; font-weight: 700; color: var(--text); }
 
-/* Merkle graph viewer */
+/* Merkle tree viewer (top-down, hash-order) */
 .modal-backdrop--graph { padding: 12px; }
-.modal--graph {
-  max-width: none; width: 100%; height: 100%; padding: 10px;
-  display: flex; flex-direction: column;
-}
-.graph-bar {
-  display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: nowrap; min-width: 0;
-}
-.graph-title { font-size: 13px; font-weight: 700; color: var(--text); flex: 0 0 auto; }
-.graph-close { flex: 0 0 auto; width: 24px; height: 24px; }
-.graph-sub { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
-.graph-roothash {
-  display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto;
-  padding: 5px 10px; border-radius: 7px; border: 1px solid var(--border);
-  background: var(--panel); cursor: pointer; transition: border-color .12s, background .12s;
-}
-.graph-roothash:hover { border-color: var(--border-strong); background: var(--panel-hover); }
-.graph-roothash-k { font-size: 10px; letter-spacing: 0.4px; color: var(--faint); flex: 0 0 auto; }
-.graph-roothash-v { font-family: var(--font-mono); font-size: 11.5px; color: var(--accent); flex: 0 0 auto; }
-.graph-roothash-ic { display: grid; place-items: center; color: var(--muted); flex: 0 0 auto; }
-.graph-roothash:hover .graph-roothash-ic { color: var(--text); }
-.graph-copy {
-  flex: 0 0 auto; padding: 3px 9px; font-size: 11px; font-weight: 600; cursor: pointer;
-  color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
-}
-.graph-copy:hover { border-color: var(--accent); color: var(--accent); }
-.graph-hint { font-size: 11px; color: var(--muted); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.graph-scroll {
-  flex: 1; min-height: 0; position: relative; overflow: hidden;
-  border: 1px solid var(--border); border-radius: 10px;
-  background: radial-gradient(circle at 1px 1px, rgba(255,255,255,0.04) 1px, transparent 0) 0 0 / 22px 22px,
-              rgba(0,0,0,0.25);
-  cursor: grab; touch-action: none;
-}
-.graph-scroll.is-panning { cursor: grabbing; }
-.graph-svg { display: block; width: 100%; height: 100%; }
-.graph-zoom { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; flex-wrap: nowrap; min-width: 0; }
+.modal--graph { max-width: none; width: 100%; height: 100%; padding: 10px; display: flex; flex-direction: column; }
+.graph-zoom { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: nowrap; min-width: 0; }
 .graph-zspacer { flex: 1 1 auto; }
-.graph-zbtn {
-  width: 24px; height: 24px; display: grid; place-items: center; cursor: pointer;
-  font-size: 15px; line-height: 1; color: var(--text);
-  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
-}
-.graph-zbtn:hover { border-color: var(--accent); color: var(--accent); }
-.graph-zlvl {
-  min-width: 42px; text-align: center; cursor: pointer;
-  font-family: var(--font-mono); font-size: 11.5px; color: var(--muted);
-}
+.graph-close { flex: 0 0 auto; width: 24px; height: 24px; }
+.graph-roothash { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; padding: 5px 10px; border-radius: 7px; border: 1px solid var(--border); background: var(--panel); cursor: pointer; transition: border-color .12s, background .12s; }
+.graph-roothash:hover { border-color: var(--border-strong); background: var(--panel-hover); }
+.graph-roothash-k { font-size: 10px; letter-spacing: 0.4px; color: var(--faint); }
+.graph-roothash-v { font-family: var(--font-mono); font-size: 11.5px; color: var(--accent); }
+.graph-roothash-ic { display: grid; place-items: center; color: var(--muted); }
+.graph-roothash:hover .graph-roothash-ic { color: var(--text); }
+.graph-roothash-ic svg { width: 12px; height: 12px; }
+.graph-zbtn { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font-size: 16px; line-height: 1; flex: 0 0 auto; }
+.graph-zbtn:hover { border-color: var(--border-strong); background: var(--panel-hover); }
+.graph-zlvl { font-family: var(--font-mono); font-size: 11px; color: var(--muted); min-width: 38px; text-align: center; cursor: pointer; flex: 0 0 auto; }
 .graph-zlvl:hover { color: var(--text); }
-.graph-zfit {
-  padding: 4px 10px; cursor: pointer; font-size: 11.5px; font-weight: 600; color: var(--text);
-  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
-}
-.graph-zfit:hover { border-color: var(--accent); color: var(--accent); }
-.graph-zhint { margin-left: auto; font-size: 11px; color: var(--muted); }
+.graph-zfit { padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font-size: 12px; flex: 0 0 auto; }
+.graph-zfit:hover { border-color: var(--border-strong); background: var(--panel-hover); }
 .graph-search { display: flex; align-items: center; gap: 7px; flex: 0 1 auto; min-width: 0; }
-.graph-search-in {
-  width: 200px; max-width: 40vw; min-width: 90px; flex: 0 1 auto; padding: 5px 10px; font-size: 12px;
-  color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 7px;
-  font-family: var(--font-sans); outline: none;
-}
+.graph-search-in { width: 200px; max-width: 38vw; min-width: 90px; padding: 5px 10px; font-size: 12px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 7px; font-family: var(--font-sans); outline: none; }
 .graph-search-in::placeholder { color: var(--muted); }
 .graph-search-in:focus { border-color: var(--accent); }
-.graph-search-x {
-  display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; cursor: pointer;
-  color: var(--muted); background: transparent; border: 1px solid var(--border);
-}
+.graph-search-x { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; cursor: pointer; color: var(--muted); background: transparent; border: 1px solid var(--border); }
 .graph-search-x svg { width: 10px; height: 10px; }
 .graph-search-x:hover { color: var(--text); border-color: var(--border-strong); }
 .graph-search-n { font-family: var(--font-mono); font-size: 11px; color: var(--accent); white-space: nowrap; }
 
-.graph-edge {
-  fill: none; stroke: url(#edgeg); stroke-width: 1.5;
-  stroke-dasharray: 1; stroke-dashoffset: 1;
-}
-.graph-name { font-family: var(--font-sans); font-size: 11.5px; font-weight: 600; fill: var(--text); }
-.graph-hash { font-family: var(--font-mono); font-size: 9.5px; fill: var(--muted); letter-spacing: 0.3px; }
-.graph-more { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); }
-.graph-node { cursor: pointer; }
-.graph-node circle, .graph-node rect { fill: var(--bg, #0a0d0c); stroke: var(--accent); stroke-width: 1.6; }
-.graph-node.is-file circle { stroke: #8FB7AC; }
-.graph-node.is-dir rect { fill: rgba(22,225,160,0.12); }
-.graph-node.is-root circle, .graph-node.is-root rect { stroke-width: 2.4; filter: drop-shadow(0 0 6px var(--accent-glow)); }
-.graph-node:hover circle, .graph-node:hover rect { fill: var(--accent-dim); }
-.graph-node.is-dup circle, .graph-node.is-dup rect { stroke-width: 2.2; }
-.dup-ring { opacity: 0.9; }
-/* spotlight: when a duplicate set is focused, the rest of the tree goes near-black */
-.is-spotlight .graph-edge { opacity: 0.06; transition: opacity .18s; }
-.graph-node.is-dim { opacity: 0.07; transition: opacity .18s; }
-.graph-node.is-focus { transition: opacity .18s; }
-.graph-node.is-focus circle, .graph-node.is-focus rect {
-  stroke-width: 3; filter: drop-shadow(0 0 9px currentColor) brightness(1.3);
-}
-.graph-node.is-focus .dup-ring { opacity: 1; stroke-width: 3.5; filter: drop-shadow(0 0 7px currentColor); }
-.graph-node.is-focus .graph-name { fill: #fff; }
-.graph-node.is-focus .graph-hash { fill: var(--text); }
-/* search matches: distinct blue accent so they don't read as a duplicate group */
-.graph-node.is-match circle, .graph-node.is-match rect {
-  stroke: #4DABF7 !important; stroke-width: 3; fill: rgba(77,171,247,0.18);
-  filter: drop-shadow(0 0 9px rgba(77,171,247,0.8));
-}
-.graph-node.is-match .graph-name { fill: #9CC2FF; }
-/* optimistic delete: node fades + pulses red, name struck through, until the tree patch removes it */
-.graph-node.is-removing circle, .graph-node.is-removing rect {
-  stroke: #E0584F !important; fill: rgba(224,88,79,0.12) !important;
-}
-.graph-node.is-removing .graph-name { fill: #E0584F; }
-.graph-name.is-strike { text-decoration: line-through; }
-.graph-node.is-removing .graph-hash { fill: #E0584F; opacity: 0.8; }
-@media (prefers-reduced-motion: no-preference) {
-  .graph-node.is-removing { animation: node-removing 1s ease-in-out infinite; }
-  @keyframes node-removing { 0%,100% { opacity: 0.85; } 50% { opacity: 0.4; } }
-}
-@media (prefers-reduced-motion: reduce) {
-  .graph-node.is-removing { opacity: 0.6; }
-}
+.graph-scroll { flex: 1; min-height: 0; position: relative; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background:
+  radial-gradient(circle at center, rgba(22,225,160,0.05) 0, transparent 70%), rgba(0,0,0,0.28); cursor: grab; touch-action: none; }
+.graph-scroll.is-panning { cursor: grabbing; }
+.graph-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--muted); font-size: 13px; cursor: default; }
+.graph-spinner { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border-strong); border-top-color: var(--accent); animation: graph-spin .7s linear infinite; }
+@keyframes graph-spin { to { transform: rotate(360deg); } }
+.graph-svg { width: 100%; height: 100%; display: block; }
 
-/* duplicate legend */
-.dup-legend {
-  position: absolute; top: 12px; right: 12px; width: 270px; max-height: calc(100% - 24px);
-  display: flex; flex-direction: column;
-  background: rgba(10,13,12,0.96); border: 1px solid var(--border-strong); border-radius: 11px;
-  box-shadow: 0 16px 40px -16px rgba(0,0,0,0.8); backdrop-filter: blur(10px); overflow: hidden;
-}
-.dup-legend-hd {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 11px 13px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 13px; color: var(--text);
-}
+/* teal links: parent → children, drawn in hash (left-to-right) order */
+.graph-edge { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: 0.42; stroke-dasharray: 1; stroke-dashoffset: 1; animation: edge-draw .5s ease forwards; }
+@keyframes edge-draw { to { stroke-dashoffset: 0; } }
+
+/* uniform bubbles */
+.bubble { cursor: pointer; animation: node-pop .35s ease backwards; }
+.bubble circle { fill: rgba(22,225,160,0.06); stroke: var(--accent-dim); stroke-width: 1.4; transition: fill .12s, stroke .12s, stroke-width .12s; }
+.bubble.is-dir circle { fill: rgba(22,225,160,0.18); stroke: var(--accent); }
+.bubble.is-root circle { fill: rgba(22,225,160,0.32); stroke: var(--accent-bright); stroke-width: 2.2; }
+/* a directory with hidden children: filled + a "+" glyph, click to expand */
+.bubble.is-collapsed circle { fill: rgba(22,225,160,0.22); stroke: var(--accent); }
+.bubble-plus { fill: var(--accent-bright); font-family: var(--font-mono); font-size: 11px; font-weight: 700; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.bubble:hover circle { fill: var(--accent-dim); stroke: var(--accent); }
+.bubble.is-changed circle { animation: node-pulse 1.1s ease 2; }
+@keyframes node-pulse { 0%,100% { stroke: var(--accent); } 50% { stroke: #FFD43B; stroke-width: 3; } }
+.bubble-label { fill: var(--muted); font-family: var(--font-mono); font-size: 11px; pointer-events: none; dominant-baseline: middle; }
+.bubble.is-dir .bubble-label, .bubble.is-root .bubble-label { fill: var(--text); }
+.bubble-hash { fill: var(--faint); font-family: var(--font-mono); font-size: 9.5px; pointer-events: none; dominant-baseline: middle; }
+.bubble-label.is-strike { text-decoration: line-through; fill: #E0584F; }
+.bubble-more { fill: var(--muted); font-family: var(--font-mono); font-size: 12px; }
+/* "+N more" truncation marker (a folder has more children than are drawn) */
+.bubble.is-more { cursor: default; }
+.bubble.is-more circle { fill: transparent; stroke: var(--faint); stroke-width: 1.2; stroke-dasharray: 2 2; }
+.bubble.is-more .bubble-label { fill: var(--faint); font-style: italic; }
+.bubble.is-removing { opacity: 0.5; }
+.is-spotlight .bubble.is-dim { opacity: 0.12; }
+.is-spotlight .graph-edge { opacity: 0.1; }
+.bubble.is-focus circle { stroke-width: 2.6; filter: drop-shadow(0 0 6px var(--accent-glow)); }
+.bubble.is-match .bubble-label { fill: var(--accent-bright); }
+.no-anim .bubble { animation: none; }
+.no-anim .graph-edge { animation: none; stroke-dashoffset: 0; }
+@media (prefers-reduced-motion: reduce) { .bubble, .graph-edge { animation: none !important; stroke-dashoffset: 0 !important; } }
+
+/* node action popover */
+.node-pop-scrim { position: absolute; inset: 0; z-index: 5; }
+.node-pop { position: absolute; z-index: 6; background: rgba(12,15,14,0.98); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: 0 14px 36px -12px rgba(0,0,0,0.8); padding: 9px 10px; min-width: 150px; backdrop-filter: blur(8px); }
+.node-pop-name { font-family: var(--font-mono); font-size: 12px; color: var(--text); margin-bottom: 8px; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node-pop-acts { display: flex; gap: 5px; }
+.node-pop-btn { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 7px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); cursor: pointer; transition: color .12s, border-color .12s, background .12s; }
+.node-pop-btn svg { width: 14px; height: 14px; }
+.node-pop-btn:hover { color: var(--accent); border-color: rgba(22,225,160,0.4); background: var(--accent-dim); }
+.node-pop-danger:hover { color: #E0584F; border-color: rgba(224,88,79,0.45); background: rgba(224,88,79,0.1); }
+
+/* duplicate legend — fills the available height, paginated to fit */
+.dup-legend { position: absolute; top: 12px; right: 12px; bottom: 12px; width: 270px; display: flex; flex-direction: column; background: rgba(10,13,12,0.96); border: 1px solid var(--border-strong); border-radius: 11px; box-shadow: 0 16px 40px -16px rgba(0,0,0,0.8); backdrop-filter: blur(10px); overflow: hidden; }
+.dup-legend-hd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 11px 13px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 13px; color: var(--text); flex: 0 0 auto; }
 .dup-legend-waste { font-family: var(--font-mono); font-size: 11px; font-weight: 600; color: #FFA94D; }
-.dup-legend-list { overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
-.dup-item {
-  display: flex; align-items: center; gap: 10px; text-align: left; cursor: pointer;
-  padding: 7px 9px; border-radius: 8px; background: rgba(255,255,255,0.03); border: 1px solid transparent;
-}
+.dup-legend-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+.dup-legend-list::-webkit-scrollbar { width: 10px; }
+.dup-legend-list::-webkit-scrollbar-track { background: transparent; }
+.dup-legend-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+.dup-legend-list::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: padding-box; }
+.dup-item { display: flex; align-items: center; gap: 10px; text-align: left; cursor: pointer; padding: 7px 9px; border-radius: 8px; background: rgba(255,255,255,0.03); border: 1px solid transparent; flex: 0 0 auto; }
 .dup-item:hover { background: rgba(255,255,255,0.06); }
 .dup-item.is-active { border-color: var(--accent); background: var(--accent-dim); }
-.dup-swatch {
-  flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center;
-  font-size: 11px; font-weight: 800; color: #04130D;
-}
+.dup-swatch { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center; font-size: 11px; font-weight: 800; color: #04130D; }
 .dup-info { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .dup-line1 { font-size: 12px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dup-line2 { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dup-legend-clear {
-  padding: 8px 13px; border-top: 1px solid var(--border); cursor: pointer;
-  font-size: 11.5px; color: var(--muted); text-align: center;
-}
-.dup-legend-clear:hover { color: var(--accent); }
-
-/* node action popover (lives inside the graph container) */
-.node-pop-scrim { position: absolute; inset: 0; z-index: 80; }
-.node-pop {
-  position: absolute; z-index: 81;
-  display: flex; flex-direction: column; gap: 7px; padding: 9px 10px;
-  background: rgba(12,16,15,0.98); border: 1px solid var(--border-strong); border-radius: 10px;
-  box-shadow: 0 14px 36px -12px rgba(0,0,0,0.85);
-}
-.node-pop-name {
-  max-width: 220px; font-size: 12px; font-weight: 600; color: var(--text);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.node-pop-acts { display: flex; gap: 6px; }
-.node-pop-btn {
-  display: grid; place-items: center; width: 30px; height: 30px; border-radius: 7px; cursor: pointer;
-  color: var(--muted); background: var(--panel); border: 1px solid var(--border);
-  transition: color .12s, border-color .12s, background .12s;
-}
-.node-pop-btn:hover { color: var(--accent); border-color: var(--accent); }
-.node-pop-btn svg { width: 14px; height: 14px; }
-.node-pop-danger:hover { color: #E0584F; border-color: rgba(224,88,79,0.5); background: rgba(224,88,79,0.08); }
-@media (prefers-reduced-motion: no-preference) {
-  .graph-edge { animation: edge-draw .5s ease-out forwards; }
-  @keyframes edge-draw { to { stroke-dashoffset: 0; } }
-  .graph-node { animation: node-pop .32s ease-out both; transform-box: fill-box; transform-origin: center; }
-  @keyframes node-pop { from { opacity: 0; transform: scale(0.4); } to { opacity: 1; transform: scale(1); } }
-  .graph-node.is-changed circle, .graph-node.is-changed rect { animation: node-pulse 1.1s ease-out 2; }
-  @keyframes node-pulse {
-    0% { stroke: var(--accent); filter: drop-shadow(0 0 0 var(--accent-glow)); }
-    40% { stroke: var(--accent-bright); filter: drop-shadow(0 0 9px var(--accent-glow)); }
-    100% { filter: drop-shadow(0 0 0 transparent); }
-  }
-}
+.dup-legend-pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 11px; border-top: 1px solid var(--border); flex: 0 0 auto; }
+.dup-pg-info { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+.dup-pg-btn { width: 26px; height: 24px; display: grid; place-items: center; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font-size: 14px; line-height: 1; }
+.dup-pg-btn:hover:not(:disabled) { border-color: var(--border-strong); background: var(--panel-hover); }
+.dup-pg-btn:disabled { opacity: 0.35; cursor: default; }
 .modal-close {
   display: grid; place-items: center; width: 28px; height: 28px; border-radius: 7px;
   background: transparent; border: 1px solid var(--border); color: var(--muted); cursor: pointer;
@@ -2777,6 +2808,7 @@ const CSS = `
 }
 .modal-text { font-size: 13.5px; line-height: 1.5; color: var(--muted); margin: 4px 0 18px; }
 .modal-text strong { color: var(--text); font-weight: 600; }
+.modal-text--warn { color: #E8B84B; margin-top: -10px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 .mbtn {
   height: 34px; padding: 0 16px; font-size: 13px; font-weight: 600;
