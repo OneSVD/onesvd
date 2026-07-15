@@ -69,6 +69,55 @@ results as a verified part of your tree. Every commit produces an artifact you c
 exact source it came from. No separate CI server to wire up. See
 [Git runners](https://onesvd.com/docs/guides/git-runners).
 
+## Verifying content
+
+The hashing rule is small enough to hold in your head — and to reimplement anywhere:
+
+- **File** — `sha256(file bytes)`.
+- **Directory** — `sha256` of its children's hex hashes, **sorted ascending and concatenated**.
+  Fixed-width hex means plain string order *is* numeric order.
+- **Empty directory** — `sha256("")` = `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- **Names are not part of the hash.** A OneSVD hash identifies *content*: renaming a file or folder
+  never changes any hash, while flipping a single byte changes every hash up to the root.
+
+### Test vector
+
+A directory containing one file with the bytes `hello` (no newline) and one empty subdirectory:
+
+| Node | sha256 |
+| --- | --- |
+| file `hello` | `2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824` |
+| empty subdirectory | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| **root** = sha256 of the two hashes above, sorted (`2cf2…` < `e3b0…`) and concatenated | `a7714b14e55f7fbfc19131515793dda1ffc3b99831c4f7fcf2ce166efaa9d1ec` |
+
+Reproduce it in any shell:
+
+```bash
+mkdir -p vec/empty && printf 'hello' > vec/file
+./onesvd-hash.sh vec
+# a7714b14e55f7fbfc19131515793dda1ffc3b99831c4f7fcf2ce166efaa9d1ec
+```
+
+### onesvd-hash.sh
+
+[`onesvd-hash.sh`](onesvd-hash.sh) is a standalone verifier — bash + python3, no OneSVD install
+required. Run it against any folder, on any machine, and compare the result with the root hash shown
+in the web UI (or with another node's output) to prove two folders hold identical content:
+
+```bash
+./onesvd-hash.sh <folder>       # print the root hash
+./onesvd-hash.sh -t <folder>    # print the hash of every entry (a tree)
+./onesvd-hash.sh -j <folder>    # print the tree as JSON
+```
+
+On an installed node the CLI fronts the same script, defaulting to the watched directory:
+
+```bash
+onesvd hash                     # root hash of $ONESVD_ROOT
+onesvd hash -t                  # every entry
+onesvd hash /some/other/folder  # any folder
+```
+
 ## Architecture
 
 OneSVD is a single installable product made of three cooperating pieces:
