@@ -334,6 +334,7 @@ func (s *Server) removeNode(r string) bool {
 }
 
 func (s *Server) scan() error {
+	postStatus("scanning", "")
 	s.root = &Node{name: ".", path: ".", kind: "directory", children: map[string]*Node{}}
 	s.index = map[string]*Node{".": s.root}
 
@@ -362,6 +363,7 @@ func (s *Server) scan() error {
 		if err != nil {
 			return nil
 		}
+		postStatus("scanning", r)
 		digest, err := hashFile(path)
 		if err != nil {
 			logf("WARNING: hash %s: %v", r, err)
@@ -388,6 +390,7 @@ func (s *Server) scan() error {
 
 	s.version = 1
 	logf("Scan complete: %d files, %d dirs", nFiles, nDirs)
+	postStatus("idle", "")
 	return nil
 }
 
@@ -400,6 +403,7 @@ func (s *Server) scan() error {
 // mutate the tree itself — it just reports drift, which main feeds into the same
 // dirty -> process -> publish pipeline as a normal event batch.
 func (s *Server) reconcile(w *fsnotify.Watcher) map[string]bool {
+	postStatus("reconciling", "")
 	drift := map[string]bool{}
 
 	// snapshot the current index paths under the lock (cheap; just keys + file meta)
@@ -480,6 +484,7 @@ func (s *Server) process(dirty map[string]bool) *Message {
 			dirsExist = append(dirsExist, r)
 			dbg("stat dir            %s", r)
 		default:
+			postStatus("hashing", r)
 			digest, err := hashFile(path)
 			if err != nil {
 				logf("WARNING: hash %s: %v", r, err)
@@ -555,6 +560,7 @@ func (s *Server) process(dirty map[string]bool) *Message {
 	for p := range deleted {
 		changes = append(changes, Change{Op: "delete", Path: p})
 	}
+	postStatus("idle", "")
 	return &Message{Version: s.version, Kind: "patch", Changes: changes}
 }
 
@@ -607,6 +613,58 @@ func (s *Server) publishRecalc(dirty map[string]bool) {
 	case s.pubCh <- Message{Kind: "recalc", Paths: paths}:
 	default:
 	}
+}
+
+// ── watcher status telemetry ─────────────────────────────────────────────────
+// Lightweight "what am I doing right now" reports for the UI, posted to the hub
+// as {kind:"status"}. Fire-and-forget: status must never slow down or block the
+// actual work. Rate-limited so hashing thousands of small files doesn't flood
+// the hub — but a long-running hash of one big file stays visible the whole time.
+var statusMu sync.Mutex
+var statusLastSent time.Time
+var statusLastState, statusLastDetail string
+
+// uploadsActive asks the hub whether any client is actively uploading. The
+// reconcile stat-walk competes with chunk appends for disk I/O, so the watcher
+// defers its periodic rescan while uploads are in flight. Fail-open: if the hub
+// is unreachable, reconcile proceeds as normal — the safety net must not depend
+// on the hub being healthy.
+var uploadsActiveClient = &http.Client{Timeout: 2 * time.Second}
+
+func uploadsActive() bool {
+	url := strings.TrimSuffix(IngestURL, "/ingest") + "/uploads-active"
+	resp, err := uploadsActiveClient.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var r struct {
+		Active int `json:"active"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&r) != nil {
+		return false
+	}
+	return r.Active > 0
+}
+
+func postStatus(state, detail string) {
+	statusMu.Lock()
+	same := state == statusLastState && detail == statusLastDetail
+	throttled := state != "idle" && time.Since(statusLastSent) < 750*time.Millisecond
+	if same || throttled {
+		statusMu.Unlock()
+		return
+	}
+	statusLastSent = time.Now()
+	statusLastState, statusLastDetail = state, detail
+	statusMu.Unlock()
+	body, _ := json.Marshal(map[string]string{"kind": "status", "state": state, "detail": detail})
+	go func() {
+		resp, err := http.Post(IngestURL, "application/json", bytes.NewReader(body))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
 }
 
 func postMessage(url string, m Message) (uint64, error) {
@@ -792,9 +850,17 @@ func main() {
 			logf("WATCH ERROR: %v", err)
 
 		case <-reconcileTick.C:
-			// periodic safety net: catch anything the event stream missed
+			// periodic safety net: catch anything the event stream missed.
+			// Deferred while a client is uploading — the full stat walk competes
+			// with chunk writes for disk I/O; the next tick after the upload
+			// finishes picks the rescan back up.
+			if uploadsActive() {
+				dbg("reconcile deferred: upload in progress")
+				continue
+			}
 			drift := s.reconcile(watcher)
 			if len(drift) == 0 {
+				postStatus("idle", "")
 				continue
 			}
 			logf("RECONCILE found %d drifted path(s) the watcher missed", len(drift))
@@ -805,6 +871,15 @@ func main() {
 
 		case <-timer.C:
 			if len(dirty) == 0 {
+				continue
+			}
+			// hashing reads files at full disk speed — while a client is
+			// uploading, that starves the hub's chunk appends. Defer the batch
+			// (keep accumulating) and retry after another debounce interval;
+			// it processes the moment uploads go quiet. Fail-open like reconcile.
+			if uploadsActive() {
+				dbg("processing deferred: upload in progress (%d dirty)", len(dirty))
+				resetTimer(timer)
 				continue
 			}
 			batch := dirty
