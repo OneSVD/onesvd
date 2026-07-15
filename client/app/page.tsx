@@ -1476,7 +1476,7 @@ export default function HomePage() {
                       ) : recalc.has(node.path) ? (
                         <span className="col-hash hash recalc"><span className="recalc-spin" />recalculating</span>
                       ) : (
-                        <code className="col-hash hash">{shortHash(node.sha256)}</code>
+                        <code className="col-hash hash">{hashDots(node.sha256)}</code>
                       )}
                       {isGhost ? <span className="col-act" /> : renderActions(node)}
                     </div>
@@ -1525,7 +1525,7 @@ export default function HomePage() {
                     ) : recalc.has(node.path) ? (
                       <span className="col-hash hash recalc"><span className="recalc-spin" />recalculating</span>
                     ) : (
-                      <code className="col-hash hash">{shortHash(node.sha256)}</code>
+                      <code className="col-hash hash">{hashDots(node.sha256)}</code>
                     )}
                     {isGhost ? <span className="col-act" /> : renderActions(node)}
                   </div>
@@ -2853,6 +2853,11 @@ function shortPath(p: string) {
 }
 function shortHash(h: string) {
   return h ? h.slice(0, 7) : "·······";
+}
+// hash-column format: ends of the hash with dots between (2cf2····9824) —
+// the tail catches copy/paste truncation that a prefix-only display hides
+function hashDots(h: string) {
+  return h && h.length >= 8 ? `${h.slice(0, 4)}····${h.slice(-4)}` : "············";
 }
 function viewUrl(relPath: string) {
   return `${VIEW_BASE}?path=${encodeURIComponent(relPath)}`;
