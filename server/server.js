@@ -266,10 +266,27 @@ function saveTreeNow() {
     console.error("saveTree:", e);
   }
 }
+// Async variant for the steady-state path: the synchronous write was blocking
+// the event loop (which also serves upload chunks) for the entire disk write of
+// a multi-MB tree JSON. Only shutdown uses the sync version now. The stringify
+// itself still costs CPU on the loop — brief — but the disk I/O no longer stalls
+// everything. An in-flight guard coalesces bursts instead of overlapping writes.
+let treeSaving = false, treeSaveAgain = false;
+function saveTreeAsync() {
+  if (!tree) return;
+  if (treeSaving) { treeSaveAgain = true; return; }
+  treeSaving = true;
+  const body = JSON.stringify({ version, tree });
+  fs.writeFile(TREE_FILE, body, (e) => {
+    treeSaving = false;
+    if (e) console.error("saveTree:", e);
+    if (treeSaveAgain) { treeSaveAgain = false; saveTreeSoon(); }
+  });
+}
 // debounce disk writes — patches can arrive in bursts
 function saveTreeSoon() {
   if (treeSaveTimer) return;
-  treeSaveTimer = setTimeout(() => { treeSaveTimer = null; saveTreeNow(); }, 1500);
+  treeSaveTimer = setTimeout(() => { treeSaveTimer = null; saveTreeAsync(); }, 5000);
 }
 
 // ── mirror tree mutation (same shape the browser applies) ────────────────────
@@ -309,10 +326,24 @@ function applyChange(root, c) {
   };
   if (idx !== -1) node.children[idx] = updated;
   else node.children.push(updated);
-  node.children.sort((a, b) => a.name.localeCompare(b.name));
+  // match the worker's hashing order exactly: ascending child hash, name tiebreak
+  node.children.sort((a, b) => {
+    const ah = a.sha256 || "", bh = b.sha256 || "";
+    if (ah !== bh) return ah < bh ? -1 : 1;
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
 }
 
+let watcherStatus = { state: "starting", detail: "", at: 0 };
+
 function handleIngest(msg) {
+  if (msg.kind === "status") {
+    // watcher telemetry: what the daemon is actively doing (scanning/hashing/
+    // reconciling/idle). Remember it for new connections and relay to everyone.
+    watcherStatus = { state: String(msg.state || "idle"), detail: String(msg.detail || ""), at: Date.now() };
+    broadcast({ kind: "watcher", ...watcherStatus });
+    return;
+  }
   if (msg.kind === "recalc") {
     // informational hint: which paths are about to be rehashed. Relay as-is,
     // no tree mutation, no version change.
@@ -323,6 +354,7 @@ function handleIngest(msg) {
     tree = msg.tree;
     version = msg.version;
     broadcast({ kind: "snapshot", version, tree });
+    hubEvent("info", `watcher resync · snapshot v${version}`);
     saveTreeSoon();
   } else if (msg.kind === "patch") {
     if (msg.version !== version + 1) return; // gap/stale -> Go resyncs from our response
@@ -428,6 +460,71 @@ function sweepTemps() {
   } catch {}
 }
 
+// ── live upload state, broadcast to every client ─────────────────────────────
+// Any window (any user) sees uploads in progress, not just the one doing the
+// uploading. Progress broadcasts are throttled so a fast chunk stream doesn't
+// flood the websocket.
+// ── upload lock ───────────────────────────────────────────────────────────────
+// When ONESVD_UPLOAD_LOCK is set (a sha256 hex of the chosen password, written
+// by the installer), every WRITE operation — upload, delete, mkdir — requires
+// the matching key in the x-upload-key header. Reads (view, download, zip) stay
+// open. The client obtains the key by hashing the password the user types.
+const UPLOAD_LOCK = (process.env.ONESVD_UPLOAD_LOCK || "").trim().toLowerCase();
+if (UPLOAD_LOCK) console.log("upload lock: ENABLED (writes require password)");
+function writeAllowed(req) {
+  if (!UPLOAD_LOCK) return true;
+  // the header carries the password itself; hash server-side (the browser can't
+  // use crypto.subtle on plain-http LAN origins). Compare digests constant-time.
+  const key = String(req.headers["x-upload-key"] || "");
+  if (!key) return false;
+  const digest = crypto.createHash("sha256").update(key).digest("hex");
+  let diff = digest.length ^ UPLOAD_LOCK.length;
+  for (let i = 0; i < digest.length; i++) diff |= digest.charCodeAt(i) ^ (UPLOAD_LOCK.charCodeAt(i) || 0);
+  return diff === 0;
+}
+function denyLocked(res) {
+  res.writeHead(403, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "locked" }));
+}
+
+// ── hub event log: a short ring of notable server events for the UI ──────────
+// (uploads, deletes, builds, client connects, failures — not routine chatter)
+const hubEvents = [];
+function hubEvent(level, line) {
+  hubEvents.push({ at: Date.now(), level, line });
+  if (hubEvents.length > 30) hubEvents.shift();
+  broadcast({ kind: "hublog", lines: hubEvents });
+}
+function fmtGB(n) {
+  if (!(n > 0)) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n >= 100 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
+}
+
+const activeUploads = new Map(); // id -> {id,name,dir,size,received,status,updated}
+const publicUploads = () => [...activeUploads.values()].map(({ id, name, dir, size, received, status, updated }) => ({ id, name, dir, size, received, status, updated }));
+let upBcastLast = 0, upBcastTimer = null;
+function broadcastUploads(force = false) {
+  const send = () => { upBcastLast = Date.now(); upBcastTimer = null; broadcast({ kind: "uploads", uploads: publicUploads() }); };
+  if (force) { if (upBcastTimer) { clearTimeout(upBcastTimer); upBcastTimer = null; } return send(); }
+  const wait = 500 - (Date.now() - upBcastLast);
+  if (wait <= 0) return send();
+  if (!upBcastTimer) upBcastTimer = setTimeout(send, wait); // trailing update
+}
+function touchUpload(id, patch) {
+  const cur = activeUploads.get(id);
+  activeUploads.set(id, { ...(cur || {}), id, ...patch, updated: Date.now() });
+}
+// prune sessions that stopped sending (closed laptop, dead tab). The on-disk
+// partial stays for resume; only the live "uploading" pill goes away.
+setInterval(() => {
+  const cutoff = Date.now() - 120 * 1000;
+  let changed = false;
+  for (const [id, u] of activeUploads) if (u.updated < cutoff) { activeUploads.delete(id); changed = true; }
+  if (changed) broadcastUploads(true);
+}, 30 * 1000).unref?.();
+
 function handleUploadInit(req, res) {
   readJsonBody(req, res, (opt) => {
     const name = path.basename(String(opt.name || ""));
@@ -447,6 +544,9 @@ function handleUploadInit(req, res) {
       received = 0;
     }
     writeMeta(id, { name, size, dir, key, created: Date.now() });
+    touchUpload(id, { name, dir, size, received, status: "uploading" });
+    broadcastUploads(true);
+    hubEvent("info", `upload ${received > 0 ? "resumed" : "started"} · ${name} (${fmtGB(size)})`);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ id, received }));
   });
@@ -499,6 +599,8 @@ function handleUploadChunk(req, res) {
       if (err) { console.error("chunk write:", err); if (!res.headersSent) { res.writeHead(500); res.end("write error"); } return; }
       let received = 0;
       try { received = fs.statSync(part).size; } catch {}
+      touchUpload(id, { name: meta.name, dir: meta.dir, size: meta.size, received, status: "uploading" });
+      broadcastUploads();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ received }));
     });
@@ -511,6 +613,7 @@ function handleUploadCancel(req, res) {
   if (!id) { res.writeHead(400); return res.end("missing id"); }
   try { fs.rmSync(partPath(id), { force: true }); } catch {}
   try { fs.rmSync(metaPath(id), { force: true }); } catch {}
+  if (activeUploads.delete(id)) { broadcastUploads(true); hubEvent("info", "upload cancelled"); }
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ ok: true }));
 }
@@ -536,17 +639,25 @@ function handleUploadFinish(req, res) {
     let size = 0;
     try { size = fs.statSync(part).size; } catch {}
     if (size !== meta.size) { // completeness check
+      touchUpload(id, { name: meta.name, dir: meta.dir, size: meta.size, received: size, status: "uploading" });
+      broadcastUploads(true);
       res.writeHead(422, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "incomplete", received: size, size: meta.size }));
     }
-    // whole-file integrity: hash the assembled file (streamed, native)
+    // whole-file integrity: hash the assembled file (streamed, native). This can
+    // take minutes for very large files — surface it as "processing" everywhere.
+    touchUpload(id, { name: meta.name, dir: meta.dir, size: meta.size, received: size, status: "processing" });
+    broadcastUploads(true);
+    const revert = () => { touchUpload(id, { status: "uploading" }); broadcastUploads(true); };
     const hash = crypto.createHash("sha256");
     const rs = fs.createReadStream(part);
-    rs.on("error", () => { if (!res.headersSent) { res.writeHead(500); res.end("hash error"); } });
+    rs.on("error", () => { revert(); if (!res.headersSent) { res.writeHead(500); res.end("hash error"); } });
     rs.on("data", (d) => hash.update(d));
     rs.on("end", () => {
       const sha = hash.digest("hex");
       if (opt.expectedSha && String(opt.expectedSha) !== sha) {
+        revert();
+        hubEvent("error", `upload integrity mismatch · ${meta.name}`);
         res.writeHead(422, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ error: "integrity mismatch", sha }));
       }
@@ -557,10 +668,14 @@ function handleUploadFinish(req, res) {
         try { fs.renameSync(part, dest); }
         catch { fs.copyFileSync(part, dest); fs.rmSync(part, { force: true }); }
       } catch (e) {
+        revert();
         res.writeHead(500);
         return res.end("move failed: " + e.message);
       }
       try { fs.rmSync(metaPath(id), { force: true }); } catch {}
+      activeUploads.delete(id);
+      broadcastUploads(true);
+      hubEvent("info", `upload complete · ${meta.name} (${fmtGB(size)})`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, sha256: sha, size }));
     });
@@ -581,9 +696,11 @@ function handleDelete(req, res) {
   try {
     fs.rmSync(target, { recursive: true, force: true });
   } catch (e) {
+    hubEvent("error", `delete failed · ${rel}`);
     res.writeHead(500);
     return res.end("delete failed: " + e.message);
   }
+  hubEvent("info", `deleted · ${rel}`);
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ ok: true }));
 }
@@ -940,6 +1057,13 @@ function repoNameFromUrl(u) {
 }
 function gitMsg(id, phase, extra = {}) {
   broadcast({ kind: "git", id, phase, ...extra });
+  if (phase === "cloning" || phase === "done" || phase === "error") {
+    const r = runners.find((x) => x.id === id);
+    const name = r ? shortRepoLog(r.repo) : id;
+    if (phase === "cloning") hubEvent("info", `runner build started · ${name}`);
+    else if (phase === "done") hubEvent("info", `runner build complete · ${name}`);
+    else hubEvent("error", `runner build failed · ${name}`);
+  }
 }
 // Stream a child process's output as runner log lines (broadcast + persisted).
 // Guards against hangs, which is what made a huge ardupilot clone look dead:
@@ -1084,8 +1208,8 @@ async function buildRunner(runner) {
     // by making it track a branch that doesn't exist.
     const cfgBranch = cfg.branch ? String(cfg.branch).trim() : "";
     if (cfgBranch && cfgBranch !== runner.branch) {
-      const chk = spawnSync("git", ["ls-remote", "--heads", runner.repo, cfgBranch], { timeout: 20000, env: gitEnv() });
-      const exists = !chk.error && chk.status === 0 && (chk.stdout || "").toString().trim().length > 0;
+      const chk = await gitAsync(["ls-remote", "--heads", runner.repo, cfgBranch]);
+      const exists = chk.ok && chk.stdout.trim().length > 0;
       if (exists) {
         console.log(`[runner] ${shortRepoLog(runner.repo)}: .onesvd.yml branch '${cfgBranch}' adopted`);
         runner.branch = cfgBranch;
@@ -1251,8 +1375,12 @@ async function buildRunner(runner) {
 }
 
 // poll every repo for a moved HEAD; build when the commit changed
-function pollRunners() {
+let pollInFlight = false;
+async function pollRunners() {
   if (runners.length === 0) return;
+  if (pollInFlight) return; // a slow remote must not stack overlapping polls
+  pollInFlight = true;
+  try {
   console.log(`[poll] checking ${runners.length} runner(s)`);
   let changed = false;
   for (const runner of runners) {
@@ -1261,7 +1389,7 @@ function pollRunners() {
       let branch = runner.branch || "";
       // self-heal older runners that have no branch: detect the default and store it
       if (!branch) {
-        branch = detectDefaultBranch(runner.repo);
+        branch = await detectDefaultBranch(runner.repo);
         if (branch) {
           runner.branch = branch;
           saveRunners();
@@ -1270,14 +1398,15 @@ function pollRunners() {
       }
       // ls-remote returns "<sha>\t<ref>" lines. Ask for the branch (or HEAD).
       const ref = branch || "HEAD";
-      const out = spawnSync("git", ["ls-remote", runner.repo, ref], { timeout: 20000, env: gitEnv() });
+      const out = await gitAsync(["ls-remote", runner.repo, ref]);
       runner.lastChecked = Date.now();
       changed = true;
-      if (out.error || out.status !== 0) {
-        console.warn(`[poll] ls-remote FAILED ${shortRepoLog(runner.repo)} (${ref}): ${out.error ? out.error.message : (out.stderr || "").toString().trim() || "exit " + out.status}`);
+      if (!out.ok) {
+        console.warn(`[poll] ls-remote FAILED ${shortRepoLog(runner.repo)} (${ref}): ${out.stderr.trim() || "nonzero exit"}`);
+        hubEvent("warn", `runner poll failed · ${shortRepoLog(runner.repo)}`);
         continue; // transient; try again next cycle
       }
-      const lines = (out.stdout || "").toString().trim().split("\n").filter(Boolean);
+      const lines = out.stdout.trim().split("\n").filter(Boolean);
       let pick = "";
       if (branch) {
         const exact = lines.find((l) => l.split(/\s+/)[1] === `refs/heads/${branch}`);
@@ -1291,14 +1420,14 @@ function pollRunners() {
       // re-detect and adopt the new default. If the user explicitly chose this
       // branch, leave it alone — it should surface as an error, not be rewritten.
       if (!sha && branch && !runner.explicitBranch) {
-        const def = detectDefaultBranch(runner.repo);
+        const def = await detectDefaultBranch(runner.repo);
         if (def && def !== branch) {
           console.warn(`[poll] ${shortRepoLog(runner.repo)}: auto-detected branch '${branch}' not found — switching to default '${def}'`);
           runner.branch = def;
           saveRunners();
-          const out2 = spawnSync("git", ["ls-remote", runner.repo, def], { timeout: 20000, env: gitEnv() });
-          if (!out2.error && out2.status === 0) {
-            const l2 = (out2.stdout || "").toString().trim().split("\n").filter(Boolean);
+          const out2 = await gitAsync(["ls-remote", runner.repo, def]);
+          if (out2.ok) {
+            const l2 = out2.stdout.trim().split("\n").filter(Boolean);
             const ex2 = l2.find((l) => l.split(/\s+/)[1] === `refs/heads/${def}`) || l2[0] || "";
             sha = ex2.split(/\s+/)[0];
             branch = def;
@@ -1333,6 +1462,7 @@ function pollRunners() {
     }
   }
   if (changed) broadcastRunners(); // push lastChecked timestamps to the UI
+  } finally { pollInFlight = false; }
 }
 function shortRepoLog(url) {
   return String(url).replace(/^git@[^:]+:/, "").replace(/\.git$/, "");
@@ -1341,24 +1471,36 @@ function shortRepoLog(url) {
 // Detect the remote's default branch (what HEAD points to) so a runner created
 // without an explicit branch tracks the real default — main, master, or other —
 // instead of guessing. Returns "" if it can't be determined.
-function detectDefaultBranch(repo) {
-  try {
-    const out = spawnSync("git", ["ls-remote", "--symref", repo, "HEAD"], { timeout: 20000, env: gitEnv() });
-    if (out.error || out.status !== 0) return "";
-    const text = (out.stdout || "").toString();
-    // line looks like: "ref: refs/heads/master\tHEAD"
-    const m = /ref:\s+refs\/heads\/(\S+)\s+HEAD/.exec(text);
-    return m ? m[1] : "";
-  } catch {
-    return "";
-  }
+// Async git call that never blocks the event loop. The sync version froze the
+// entire hub — including in-flight upload chunks — for the full network
+// round-trip (up to the 20s timeout on a bad day).
+function gitAsync(args, timeoutMs = 20000) {
+  return new Promise((resolve) => {
+    let out = "", err = "";
+    let child;
+    try { child = spawn("git", args, { env: gitEnv() }); }
+    catch (e) { return resolve({ ok: false, stdout: "", stderr: String(e && e.message || e) }); }
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, timeoutMs);
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("error", (e) => { clearTimeout(timer); resolve({ ok: false, stdout: "", stderr: String(e && e.message || e) }); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ ok: code === 0, stdout: out, stderr: err }); });
+  });
+}
+
+async function detectDefaultBranch(repo) {
+  const out = await gitAsync(["ls-remote", "--symref", repo, "HEAD"]);
+  if (!out.ok) return "";
+  // line looks like: "ref: refs/heads/master\tHEAD"
+  const m = /ref:\s+refs\/heads\/(\S+)\s+HEAD/.exec(out.stdout);
+  return m ? m[1] : "";
 }
 
 function handleAddRunner(req, res) {
   if (!hasGit) { res.writeHead(503); return res.end("git not available on server"); }
   let body = "";
   req.on("data", (c) => { body += c; if (body.length > 1e6) req.destroy(); });
-  req.on("end", () => {
+  req.on("end", async () => {
     let opt;
     try { opt = JSON.parse(body || "{}"); } catch { res.writeHead(400); return res.end("bad json"); }
 
@@ -1382,7 +1524,7 @@ function handleAddRunner(req, res) {
     const explicitBranch = !!(opt.branch && String(opt.branch).trim());
     let branch = explicitBranch ? String(opt.branch).trim() : "";
     if (!branch) {
-      branch = detectDefaultBranch(repo);
+      branch = await detectDefaultBranch(repo);
       if (branch) console.log(`[runner] ${shortRepoLog(repo)}: detected default branch '${branch}'`);
       else console.warn(`[runner] ${shortRepoLog(repo)}: could not detect default branch; will track HEAD`);
     }
@@ -1467,7 +1609,7 @@ const requestHandler = (req, res) => {
         res.setHeader("Access-Control-Allow-Origin", "*");
       }
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Chunk-Sha256");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Chunk-Sha256, X-Upload-Key");
 
       if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
 
@@ -1503,6 +1645,14 @@ const requestHandler = (req, res) => {
 
       if (req.method === "POST" && req.url.startsWith("/session")) return handleSession(req, res);
       if (req.method === "POST" && req.url.startsWith("/logout")) return handleLogout(req, res);
+      // verify an upload-lock key without performing any write
+      if (req.method === "POST" && req.url.startsWith("/unlock")) {
+        if (!UPLOAD_LOCK) { res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ ok: true, locked: false })); }
+        if (writeAllowed(req)) { res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ ok: true, locked: true })); }
+        return denyLocked(res);
+      }
+      // write operations respect the upload lock; reads (view/download/zip) do not
+      if (req.method === "POST" && /^\/(upload|mkdir|delete)/.test(req.url) && !writeAllowed(req)) return denyLocked(res);
       if (req.method === "POST" && req.url.startsWith("/upload/init")) return handleUploadInit(req, res);
       if (req.method === "POST" && req.url.startsWith("/upload/chunk")) return handleUploadChunk(req, res);
       if (req.method === "POST" && req.url.startsWith("/upload/finish")) return handleUploadFinish(req, res);
@@ -1549,10 +1699,18 @@ wss.on("connection", (ws, req) => {
     return;
   }
   console.log(`[ws]  ${ip}  connected`);
-  if (tree) ws.send(JSON.stringify({ kind: "snapshot", version, tree }));
+  hubEvent("info", `client connected · ${ip}`);
+  // small state first: these are bytes, the snapshot is tens of MB. Sending the
+  // snapshot first made the lock/uploads/resume UI wait behind its stringify,
+  // transfer, and parse — the client can act on these instantly instead.
+  ws.send(JSON.stringify({ kind: "lock", locked: UPLOAD_LOCK !== "" }));
+  ws.send(JSON.stringify({ kind: "uploads", uploads: publicUploads() }));
   ws.send(JSON.stringify({ kind: "runners", runners: runners.map(publicRunner) }));
+  ws.send(JSON.stringify({ kind: "watcher", ...watcherStatus }));
+  ws.send(JSON.stringify({ kind: "hublog", lines: hubEvents }));
   const disk = diskInfo();
   if (disk) ws.send(JSON.stringify({ kind: "disk", disk }));
+  if (tree) ws.send(JSON.stringify({ kind: "snapshot", version, tree }));
 });
 
 // push disk/quota usage to all clients periodically (free space drifts
@@ -1585,6 +1743,12 @@ if (!AUTH_TOKEN && ALLOW_IPS.length === 0) {
 // ── loopback ingest (Go watcher) ─────────────────────────────────────────────
 
 const ingest = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/uploads-active") {
+    // the watcher asks this right before each reconcile tick, so it can defer
+    // its stat-storm while a client is actively uploading (I/O contention)
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ active: activeUploads.size }));
+  }
   if (req.method === "POST" && req.url === "/ingest") {
     let body = "";
     req.on("data", (d) => (body += d));
