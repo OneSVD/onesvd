@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 // ── config ──────────────────────────────────────────────────────────────────
-const APP_VERSION = "1.4.0"; // OneSVD interface version
 // Source commit of the running build, injected as NEXT_PUBLIC_ONESVD_COMMIT at
 // build time. Falls back to the literal below when built outside the installer.
 const COMMIT = process.env.NEXT_PUBLIC_ONESVD_COMMIT || "895cc96";
@@ -51,6 +50,8 @@ const MKDIR_URL = `${HUB.http}/mkdir`;
 const CHUNK_SIZE = 8 * 1024 * 1024;          // 8 MB chunks
 const CHUNK_THRESHOLD = 64 * 1024 * 1024;    // files larger than this upload resumably
 const UPLOAD_CANCEL_URL = `${HUB.http}/upload/cancel`;
+const UPLOAD_STATUS_URL = `${HUB.http}/upload/status`;
+const UNLOCK_URL = `${HUB.http}/unlock`;
 const GIT_URL = `${HUB.http}/git`;
 const RUNNERS_DELETE_URL = `${HUB.http}/runners/delete`;
 const RUNNERS_BUILD_URL = `${HUB.http}/runners/build`;
@@ -59,9 +60,44 @@ const SESSION_URL = `${HUB.http}/session`; // exchange token -> cookie
 
 // bearer token for write endpoints; mirrored from React state into this holder
 // so plain (non-component) helpers like xhrUpload can read it.
+// ── tiny IndexedDB cache for the tree snapshot ───────────────────────────────
+// The tree is far too big for localStorage; IDB stores the object natively (no
+// stringify/parse) and writes off the main thread. Used stale-while-revalidate:
+// render the cached tree instantly on load, the hub's live snapshot replaces it.
+function idbOpen(): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open("onesvd", 1);
+      req.onupgradeneeded = () => { try { req.result.createObjectStore("kv"); } catch {} };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch { resolve(null); }
+  });
+}
+async function idbGet<T>(key: string): Promise<T | null> {
+  const db = await idbOpen();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const rq = db.transaction("kv").objectStore("kv").get(key);
+      rq.onsuccess = () => resolve((rq.result as T) ?? null);
+      rq.onerror = () => resolve(null);
+    } catch { resolve(null); }
+  });
+}
+async function idbSet(key: string, value: unknown): Promise<void> {
+  const db = await idbOpen();
+  if (!db) return;
+  try { db.transaction("kv", "readwrite").objectStore("kv").put(value, key); } catch {}
+}
+
 let authToken = "";
+let uploadKey = ""; // upload-lock password (in memory + localStorage, device-wide); sent on writes
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
-  return authToken ? { Authorization: `Bearer ${authToken}`, ...(extra || {}) } : { ...(extra || {}) };
+  const h: Record<string, string> = { ...(extra || {}) };
+  if (authToken) h.Authorization = `Bearer ${authToken}`;
+  if (uploadKey) h["x-upload-key"] = uploadKey;
+  return h;
 }
 
 // ── types ───────────────────────────────────────────────────────────────────
@@ -86,7 +122,17 @@ type Msg =
   | { kind: "recalc"; paths: string[] }
   | { kind: "git"; id: string; phase: GitPhase; line?: string; message?: string; repo?: string; dest?: string; cmd?: string; sha?: string }
   | { kind: "runners"; runners: RunnerInfo[] }
+  | { kind: "uploads"; uploads: RemoteUpload[] }
+  | { kind: "watcher"; state: string; detail: string; at: number }
+  | { kind: "hublog"; lines: HubEvent[] }
+  | { kind: "lock"; locked: boolean }
   | { kind: "disk"; disk: { total: number; free: number; used: number; quota: boolean } };
+type HubEvent = { at: number; level: "info" | "warn" | "error"; line: string };
+type RemoteUpload = {
+  id: string; name: string; dir: string; size: number; received: number;
+  status: "uploading" | "processing";
+  updated: number; // hub-side last-activity timestamp
+};
 type GitPhase = "cloning" | "building" | "copying" | "done" | "error" | "log";
 type RunHistory = {
   runId: string; at: number; finishedAt: number; durationMs: number;
@@ -108,6 +154,7 @@ type PendingUpload = {
   type: "file" | "directory";
   size: number;
   status: "uploading" | "processing";
+  pct?: number; // hub-reported progress (remote uploads only)
 };
 type Toast = {
   id: number;
@@ -129,6 +176,18 @@ export default function HomePage() {
   const [recalc, setRecalc] = useState<Set<string>>(new Set());
   const [cwd, setCwd] = useState("."); // current directory path
   const [dragOver, setDragOver] = useState(false);
+  const [remoteUploads, setRemoteUploads] = useState<RemoteUpload[]>([]); // hub-broadcast uploads (all clients)
+  const [watcher, setWatcher] = useState<{ state: string; detail: string } | null>(null); // daemon activity
+  const [watcherLog, setWatcherLog] = useState<{ at: number; state: string; detail: string }[]>([]); // short recent-activity log
+  const [hubLog, setHubLog] = useState<HubEvent[]>([]); // hub-broadcast server events
+  const [lockActive, setLockActive] = useState(false); // hub has an upload lock configured
+  const [lockKnown, setLockKnown] = useState(false);    // hub has told us either way — until then, show no upload affordance
+  const [unlocked, setUnlocked] = useState(false);     // this tab has provided the password
+  const [lockModal, setLockModal] = useState(false);
+  const [lockPw, setLockPw] = useState("");
+  const [lockErr, setLockErr] = useState("");
+  const [uploadsSynced, setUploadsSynced] = useState(false); // first uploads broadcast received
+  const [nowTick, setNowTick] = useState(() => Date.now()); // drives staleness re-evaluation
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [folderModal, setFolderModal] = useState(false);
@@ -279,6 +338,7 @@ export default function HomePage() {
   const runnersRef = useRef<RunnerInfo[]>([]);
   useEffect(() => { runnersRef.current = runners; }, [runners]);
   const buildToasts = useRef<Map<string, number>>(new Map()); // build id -> toast id
+  const uploadCtls = useRef<Map<number, { cancelled: boolean; id: string }>>(new Map()); // toast id -> cancel control
 
   // load saved bearer token once; keep the module-level holder in sync so the
   // upload XHR (a plain function) can read it too
@@ -293,6 +353,34 @@ export default function HomePage() {
     } catch {}
     setTokenLoaded(true);
   }, []);
+
+  // ── snapshot cache: render the last known tree instantly on load ────────────
+  // (stale-while-revalidate: the hub's live snapshot on ws connect replaces it,
+  // and subsequent patches keep it current — sync happens naturally)
+  const gotLiveTree = useRef(false);
+  const [cacheChecked, setCacheChecked] = useState(false); // the IDB read settled (hit or miss)
+  const [slowWait, setSlowWait] = useState(false);         // no tree for a long time — show the full message
+  useEffect(() => {
+    idbGet<{ version: number; tree: TreeNode }>("tree").then((cached) => {
+      if (cached && !gotLiveTree.current) { // a fresh snapshot may beat the cache read
+        setTree((prev) => prev ?? cached.tree);
+        setVersion((v) => v || cached.version);
+      }
+    }).finally(() => setCacheChecked(true));
+  }, []);
+  // the "waiting for snapshot" explanation only earns its place after a real
+  // wait — a quiet spinner covers the normal sub-second connect
+  useEffect(() => {
+    const t = setTimeout(() => setSlowWait(true), 8000);
+    return () => clearTimeout(t);
+  }, []);
+  // persist the current tree (debounced — patches arrive in bursts) so the next
+  // load can render immediately
+  useEffect(() => {
+    if (!tree) return;
+    const t = setTimeout(() => { idbSet("tree", { version, tree }); }, 3000);
+    return () => clearTimeout(t);
+  }, [tree, version]);
 
   // on load, surface any interrupted large uploads so they can be resumed
   useEffect(() => {
@@ -366,6 +454,46 @@ export default function HomePage() {
           setRunners(msg.runners);
           return;
         }
+        if (msg.kind === "uploads") {
+          setRemoteUploads(msg.uploads);
+          setUploadsSynced(true);
+          return;
+        }
+        if (msg.kind === "hublog") {
+          setHubLog(msg.lines);
+          return;
+        }
+        if (msg.kind === "lock") {
+          setLockActive(msg.locked);
+          if (!msg.locked) {
+            setUnlocked(false);
+            setLockKnown(true); // no lock configured — the + is correct
+            return;
+          }
+          // a key remembered on this device may still be valid. Hold lockKnown
+          // until that's settled, so we render neither + nor padlock and never
+          // flash the wrong one (same rule as the plus-before-lock fix, mirrored).
+          let saved = "";
+          try { saved = localStorage.getItem("onesvd_upkey") || ""; } catch {}
+          if (!saved) { setLockKnown(true); return; } // no key — padlock is correct
+          fetch(UNLOCK_URL, { method: "POST", headers: { ...authHeaders(), "x-upload-key": saved } })
+            .then((r) => {
+              if (r.ok) { uploadKey = saved; setUnlocked(true); }
+              else { try { localStorage.removeItem("onesvd_upkey"); } catch {} }
+            })
+            .catch(() => {})
+            .finally(() => setLockKnown(true));
+          return;
+        }
+        if (msg.kind === "watcher") {
+          setWatcher({ state: msg.state, detail: msg.detail });
+          setWatcherLog((log) => {
+            const last = log[log.length - 1];
+            if (last && last.state === msg.state && last.detail === msg.detail) return log;
+            return [...log, { at: msg.at || Date.now(), state: msg.state, detail: msg.detail }].slice(-6);
+          });
+          return;
+        }
         if (msg.kind === "git") {
           // surface build activity globally (toast) so a poll-triggered build is
           // visible even when the Git Runners modal is closed. One toast per
@@ -403,6 +531,7 @@ export default function HomePage() {
           return;
         }
         if (msg.kind === "snapshot") {
+          gotLiveTree.current = true;
           setTree(msg.tree);
           setVersion(msg.version);
           setRecalc(new Set());
@@ -453,6 +582,70 @@ export default function HomePage() {
     return () => window.removeEventListener("keydown", onKey);
   }, [folderModal, confirmDelete, gitModal, tokenModal]);
 
+  // remote uploads shaped like local PendingUpload so ghost rows render the
+  // same way; keyed by tree path, local pending takes precedence
+  const remotePendingByPath = useMemo(() => {
+    const m = new Map<string, PendingUpload>();
+    for (const u of remoteUploads) {
+      const p = u.dir === "." ? u.name : `${u.dir}/${u.name}`;
+      if (pending.has(p)) continue;
+      m.set(p, {
+        path: p, name: u.name, dir: u.dir, type: "file", size: u.size, status: u.status,
+        pct: u.size > 0 ? Math.min(100, (u.received / u.size) * 100) : undefined,
+      });
+    }
+    return m;
+  }, [remoteUploads, pending]);
+
+  // ── resume gating ────────────────────────────────────────────────────────────
+  // A persisted partial is only "interrupted" when NOBODY is actively uploading
+  // it. localStorage is shared across tabs, so tab B refreshing mid-upload would
+  // otherwise offer to resume a file tab A is still pushing. "Active" means the
+  // hub saw a chunk recently (15s) or is hashing the finished file (processing —
+  // no chunk traffic for minutes by design). A 5s tick re-evaluates staleness so
+  // an orphaned upload surfaces as resumable everywhere shortly after it stalls.
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
+  const remoteById = useMemo(() => new Map(remoteUploads.map((u) => [u.id, u])), [remoteUploads]);
+  const visibleResumable = useMemo(() => {
+    return resumable
+      .map((u) => { const r = remoteById.get(u.id); return r ? { ...u, received: r.received } : u; }) // live %
+      .filter((u) => {
+        const r = remoteById.get(u.id);
+        if (!r) return true; // not tracked by the hub -> genuinely orphaned
+        if (r.status === "processing") return false;
+        return nowTick - r.updated > 15000; // stalled "uploading" -> offer resume
+      });
+  }, [resumable, remoteById, nowTick]);
+  // when an id leaves the hub's live list, it either completed or stalled+pruned:
+  // ask /upload/status — 404 means done/cancelled (drop it), 200 means a partial
+  // still exists (keep it, with the authoritative received count)
+  const prevRemoteIds = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const ids = new Set(remoteUploads.map((u) => u.id));
+    for (const id of prevRemoteIds.current) {
+      if (ids.has(id) || !resumable.some((u) => u.id === id)) continue;
+      fetch(`${UPLOAD_STATUS_URL}?id=${encodeURIComponent(id)}`, { headers: authHeaders() })
+        .then((res) => {
+          if (res.status === 404) {
+            clearPersistedUpload(id);
+            setResumable((rs) => rs.filter((u) => u.id !== id));
+            return null;
+          }
+          return res.ok ? res.json() : null;
+        })
+        .then((st) => {
+          if (st && typeof st.received === "number") {
+            setResumable((rs) => rs.map((u) => (u.id === id ? { ...u, received: st.received } : u)));
+          }
+        })
+        .catch(() => {});
+    }
+    prevRemoteIds.current = ids;
+  }, [remoteUploads, resumable]);
+
   const current = tree ? nodeAt(tree, cwd) : null;
   const items = useMemo(() => {
     const c = current?.children ?? [];
@@ -469,11 +662,18 @@ export default function HomePage() {
       ghosts.push({ name: p.name, path: p.path, type: p.type, sha256: "", size: p.size, children: p.type === "directory" ? [] : undefined });
       existing.add(p.name);
     }
+    // uploads happening in OTHER windows/users (hub-broadcast) show here too,
+    // so every client renders the same state; local pending wins on collisions
+    for (const u of remoteUploads) {
+      if (u.dir !== cwd || existing.has(u.name)) continue;
+      ghosts.push({ name: u.name, path: u.dir === "." ? u.name : `${u.dir}/${u.name}`, type: "file", sha256: "", size: u.size, children: undefined });
+      existing.add(u.name);
+    }
     ghosts.sort((a, b) =>
       a.type !== b.type ? (a.type === "directory" ? -1 : 1) : a.name.localeCompare(b.name)
     );
     return [...real, ...ghosts];
-  }, [current, pending, cwd, removing]);
+  }, [current, pending, remoteUploads, cwd, removing]);
 
   const folderBytes = useMemo(() => (current ? count(current).bytes : 0), [current]);
 
@@ -776,7 +976,7 @@ export default function HomePage() {
         className="act-btn act-danger"
         title={`Delete ${node.type === "directory" ? "folder" : "file"}`}
         aria-label={`Delete ${node.name}`}
-        onClick={() => setConfirmDelete({ path: node.path, name: node.name, type: node.type })}
+        onClick={() => requestDelete({ path: node.path, name: node.name, type: node.type })}
       >
         {Trash}
       </button>
@@ -814,6 +1014,7 @@ export default function HomePage() {
   // chunked path (one at a time); everything else uses the batched multipart path.
   const uploadList = async (entries: { file: File; relPath: string }[]) => {
     if (!entries.length) return;
+    if (!ensureUnlocked()) return;
     const large = entries.filter((e) => e.file.size > CHUNK_THRESHOLD);
     const small = entries.filter((e) => e.file.size <= CHUNK_THRESHOLD);
     if (small.length) await uploadSmall(small);
@@ -821,22 +1022,100 @@ export default function HomePage() {
   };
 
   // discard an interrupted upload: forget it locally and delete the server partial
-  const cancelResumable = (u: PersistedUpload) => {
-    setResumable((r) => r.filter((x) => x.id !== u.id));
-    clearPersistedUpload(u.id);
-    fetch(`${UPLOAD_CANCEL_URL}?id=${encodeURIComponent(u.id)}`, { method: "POST", headers: authHeaders() }).catch(() => {});
+  // Cancelling deletes the server partial, so it's a WRITE: the upload lock
+  // applies, and local state (including the localStorage record other tabs
+  // share) is only forgotten AFTER the hub confirms the delete. The old
+  // optimistic order wiped the shared record even when the hub refused (403
+  // locked), stranding an orphaned partial with no resume UI anywhere.
+  const cancelResumable = async (u: PersistedUpload) => {
+    if (!ensureUnlocked()) return;
+    try {
+      const res = await fetch(`${UPLOAD_CANCEL_URL}?id=${encodeURIComponent(u.id)}`, { method: "POST", headers: authHeaders() });
+      if (res.status === 403) { setLockErr(""); setLockModal(true); return; } // key went stale — re-prompt, keep the entry
+      if (!res.ok) throw new Error((await res.text().catch(() => "")) || `HTTP ${res.status}`);
+      setResumable((r) => r.filter((x) => x.id !== u.id));
+      clearPersistedUpload(u.id);
+    } catch (e: any) {
+      pushToast("Couldn't cancel upload", "error", e?.message || String(e));
+    }
   };
-  const cancelAllResumable = () => {
-    for (const u of resumable) cancelResumable(u);
+  const cancelAllResumable = async () => {
+    if (!ensureUnlocked()) return;
+    for (const u of visibleResumable) await cancelResumable(u);
+  };
+
+  // ── upload lock (client side; the hub enforces regardless) ─────────────────
+  const isLocked = lockActive && !unlocked;
+  // returns true when writes may proceed; otherwise opens the unlock modal
+  const ensureUnlocked = (): boolean => {
+    if (!isLocked) return true;
+    setLockErr("");
+    setLockModal(true);
+    return false;
+  };
+  const requestDelete = (node: { path: string; name: string; type: "file" | "directory" }) => {
+    if (!ensureUnlocked()) return;
+    setConfirmDelete(node);
+  };
+  // re-lock this device: forget the key everywhere; the padlock FAB returns.
+  // Writing localStorage also fires the storage event in other tabs, so the
+  // whole device locks (and unlocks) together.
+  const relockDevice = () => {
+    uploadKey = "";
+    try { localStorage.removeItem("onesvd_upkey"); } catch {}
+    setUnlocked(false);
+    pushToast("Web changes locked", "done");
+  };
+  // cross-tab sync: an unlock/re-lock in any tab applies to all of them live
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== "onesvd_upkey") return;
+      const v = e.newValue || "";
+      uploadKey = v;
+      setUnlocked(!!v && lockActive);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [lockActive]);
+
+  const submitUnlock = async () => {
+    const pw = lockPw;
+    if (!pw) { setLockErr("enter the password"); return; }
+    try {
+      const res = await fetch(UNLOCK_URL, { method: "POST", headers: { ...authHeaders(), "x-upload-key": pw } });
+      if (res.ok) {
+        uploadKey = pw;
+        try { localStorage.setItem("onesvd_upkey", pw); } catch {}
+        setUnlocked(true);
+        setLockModal(false);
+        setLockPw("");
+        pushToast("Web changes unlocked", "done");
+      } else {
+        setLockErr("wrong password");
+      }
+    } catch {
+      setLockErr("couldn't reach the server");
+    }
+  };
+
+  // cancel an ACTIVE chunked upload from its progress toast. The loop notices
+  // at the next chunk boundary (≤ one chunk's upload time), then cleans up.
+  const cancelActiveUpload = (toastId: number) => {
+    const ctl = uploadCtls.current.get(toastId);
+    if (!ctl) return;
+    ctl.cancelled = true;
+    updateToast(toastId, { current: "cancelling…" });
   };
 
   // open the file picker for one specific interrupted upload
   const pickResume = (u: PersistedUpload) => {
+    if (!ensureUnlocked()) return; // resuming is a write — don't even open the picker
     resumeTarget.current = u;
     resumeInput.current?.click();
   };
   // resume a specific upload to its ORIGINAL folder (not the current dir)
   const resumeUpload = (target: PersistedUpload, file: File) => {
+    if (!ensureUnlocked()) return;
     if (file.name !== target.name || file.size !== target.size) {
       pushToast(`That isn't ${target.name}`, "error", "pick the same file (name and size must match)");
       return;
@@ -860,23 +1139,38 @@ export default function HomePage() {
 
     const destLabel = dir === "." ? "/" : "/" + dir;
     const id = ++toastId.current;
+    const ctl = { cancelled: false, id: "" };
+    uploadCtls.current.set(id, ctl);
     setToasts((ts) => [...ts, { id, label: file.name, dest: destLabel, sent: 0, total: file.size, status: "active", current: "starting…" }]);
     // this file→dir is now being uploaded — drop it from the resume list
     setResumable((r) => r.filter((u) => !(u.name === file.name && u.size === file.size && u.dir === dir)));
     try {
       await chunkedUpload(file, dir, (sent, retrying) => {
-        updateToast(id, { sent, current: retrying ? "reconnecting…" : `${pct(sent, file.size)}%` });
-      });
+        updateToast(id, { sent, current: retrying ? "reconnecting…" : `${pctStr(sent, file.size)}%` });
+      }, ctl);
       if (useGhost) setPending((m) => { const n = new Map(m); const cur = n.get(ghostPath); if (cur) n.set(ghostPath, { ...cur, status: "processing" }); return n; });
       updateToast(id, { sent: file.size, status: "done", current: undefined });
       setTimeout(() => dismissToast(id), 3500);
       setTimeout(clearGhost, 20000); // safety net; the tree patch normally clears it
     } catch (e: any) {
+      if (e?.cancelled) {
+        // user cancelled: drop the toast + ghost, forget the partial locally,
+        // and tell the hub to delete it (which also clears every other window)
+        dismissToast(id);
+        clearGhost();
+        if (ctl.id) {
+          clearPersistedUpload(ctl.id);
+          fetch(`${UPLOAD_CANCEL_URL}?id=${encodeURIComponent(ctl.id)}`, { method: "POST", headers: authHeaders() }).catch(() => {});
+        }
+        return;
+      }
       const auth = e?.message === "AUTH" || e?.auth;
       updateToast(id, { status: "error", error: auth ? "auth required" : e?.message || String(e) });
       setTimeout(() => dismissToast(id), 8000);
       clearGhost();
       if (auth) setTokenModal(true);
+    } finally {
+      uploadCtls.current.delete(id);
     }
   };
 
@@ -1032,9 +1326,12 @@ export default function HomePage() {
     processDrop(roots, flat);
   };
 
+  // the dropzone reacts only to drags that carry OS files ("Files" in types) —
+  // internal drags (links, text selections) must not trigger the upload overlay
+  const isFileDrag = (e: React.DragEvent) => Array.from(e.dataTransfer?.types || []).includes("Files");
   const dragProps = {
-    onDragEnter: (e: React.DragEvent) => { e.preventDefault(); dragDepth.current++; setDragOver(true); },
-    onDragOver: (e: React.DragEvent) => e.preventDefault(),
+    onDragEnter: (e: React.DragEvent) => { if (!isFileDrag(e)) return; e.preventDefault(); dragDepth.current++; setDragOver(true); },
+    onDragOver: (e: React.DragEvent) => { if (isFileDrag(e)) e.preventDefault(); },
     onDragLeave: () => { dragDepth.current = Math.max(0, dragDepth.current - 1); if (dragDepth.current === 0) setDragOver(false); },
     onDrop,
   };
@@ -1117,7 +1414,7 @@ export default function HomePage() {
               <div className="folder-empty">This folder is empty.</div>
             ) : (
               items.map((node) => {
-                const p = pending.get(node.path);
+                const p = pending.get(node.path) ?? remotePendingByPath.get(node.path);
                 const isGhost = !!p && node.sha256 === "";
                 if (node.type === "directory") {
                   const runner = runnerByPath.get(node.path);
@@ -1175,7 +1472,7 @@ export default function HomePage() {
                         {isGhost ? "" : `${node.children?.length ?? 0} ${(node.children?.length ?? 0) === 1 ? "item" : "items"}`}
                       </span>
                       {isGhost ? (
-                        <span className="col-hash hash recalc"><span className="recalc-spin" />{p!.status === "uploading" ? "uploading" : "processing"}</span>
+                        <span className="col-hash hash recalc"><span className="recalc-spin" />{p!.status === "uploading" ? (p!.pct != null ? `uploading · ${p!.pct.toFixed(3)}%` : "uploading") : "processing"}</span>
                       ) : recalc.has(node.path) ? (
                         <span className="col-hash hash recalc"><span className="recalc-spin" />recalculating</span>
                       ) : (
@@ -1204,6 +1501,7 @@ export default function HomePage() {
                         target="_blank"
                         rel="noopener noreferrer"
                         title={`View ${node.name}`}
+                        draggable={false}
                       >
                         <span className={`ic ${fileRunner ? "ic--runner" : "ic--file"}`} aria-hidden>{fileRunner ? GitIcon : File}</span>
                         <span className="nm">{node.name}</span>
@@ -1223,7 +1521,7 @@ export default function HomePage() {
                     )}
                     <span className="col-size meta">{formatBytes(node.size ?? 0)}</span>
                     {isGhost ? (
-                      <span className="col-hash hash recalc"><span className="recalc-spin" />{p!.status === "uploading" ? "uploading" : "processing"}</span>
+                      <span className="col-hash hash recalc"><span className="recalc-spin" />{p!.status === "uploading" ? (p!.pct != null ? `uploading · ${p!.pct.toFixed(3)}%` : "uploading") : "processing"}</span>
                     ) : recalc.has(node.path) ? (
                       <span className="col-hash hash recalc"><span className="recalc-spin" />recalculating</span>
                     ) : (
@@ -1255,7 +1553,39 @@ export default function HomePage() {
                 </span>
               );
             })()}
-            <span className="sb-version">OneSVD v{APP_VERSION} · {COMMIT_SHORT}</span>
+            {hubLog.length > 0 && (() => {
+              const hasRecentErr = hubLog.some((l) => l.level !== "info" && nowTick - l.at < 60000);
+              return (
+                <span className={`sb-hub${hasRecentErr ? " is-err" : ""}`} tabIndex={0} aria-label="Server log">
+                  <span className="sb-hub-ic" aria-hidden>{ServerIcon}</span>
+                  <span className="sb-hub-pop" role="tooltip">
+                    <span className="sb-pop-row"><span className="sb-pop-k">Server</span><span className="sb-pop-v">recent events</span></span>
+                    {hubLog.slice(-8).reverse().map((l) => (
+                      <span className={`sb-wlog-line sb-hlog--${l.level}`} key={l.at + l.line}>
+                        <span className="sb-wlog-t">{new Date(l.at).toLocaleTimeString([], { hour12: false })}</span>
+                        <span className="sb-wlog-d" title={l.line}>{l.line}</span>
+                      </span>
+                    ))}
+                  </span>
+                </span>
+              );
+            })()}
+            {watcher && (
+              <span className={`sb-watcher is-${watcher.state}`} tabIndex={0} aria-label={`Watcher ${watcher.state}`}>
+                <span className="sb-watcher-ic" aria-hidden>{Eyes}</span>
+                <span className="sb-watcher-pop" role="tooltip">
+                  <span className="sb-pop-row"><span className="sb-pop-k">Watcher</span><span className="sb-pop-v">{watcher.state}</span></span>
+                  {watcherLog.slice().reverse().map((l) => (
+                    <span className="sb-wlog-line" key={l.at + l.state + l.detail}>
+                      <span className="sb-wlog-t">{new Date(l.at).toLocaleTimeString([], { hour12: false })}</span>
+                      <span className="sb-wlog-s">{l.state}</span>
+                      {l.detail && <span className="sb-wlog-d" title={l.detail}>{shortPath(l.detail)}</span>}
+                    </span>
+                  ))}
+                </span>
+              </span>
+            )}
+            <span className="sb-version">OneSVD · {COMMIT_SHORT}</span>
           </div>
 
           {dragOver && (
@@ -1270,20 +1600,28 @@ export default function HomePage() {
       ) : (
         <main className="explorer">
           <div className="empty">
-            <div className="empty-glyph" aria-hidden>{DiamondLg}</div>
-            <p className="empty-title">
-              {conn === "offline" ? "Reconnecting to the tree" : "Waiting for the first snapshot"}
-            </p>
-            <p className="empty-sub">
-              {conn === "offline"
-                ? "The hub went quiet. Holding the line and retrying."
-                : "Connected — the watcher hasn't published yet. Is it running?"}
-            </p>
+            {!cacheChecked || !slowWait ? (
+              // cache read pending, or a normal brief connect: just a quiet spinner —
+              // no message flashing for the sub-second case
+              <span className="graph-spinner empty-spinner" aria-label="Loading" />
+            ) : (
+              <>
+                <div className="empty-glyph" aria-hidden>{DiamondLg}</div>
+                <p className="empty-title">
+                  {conn === "offline" ? "Reconnecting to the tree" : "Waiting for the first snapshot"}
+                </p>
+                <p className="empty-sub">
+                  {conn === "offline"
+                    ? "The hub went quiet. Holding the line and retrying."
+                    : "Connected — the watcher hasn't published yet. Is it running?"}
+                </p>
+              </>
+            )}
           </div>
         </main>
       )}
 
-      {(toasts.length > 0 || resumable.length > 0) && (
+      {(toasts.length > 0 || (uploadsSynced && visibleResumable.length > 0)) && (
         <div className={`bl-stack${graphOpen ? " bl-stack--graph" : ""}`}>
           {toasts.length > 0 && (
             <div className="toasts">
@@ -1295,8 +1633,12 @@ export default function HomePage() {
                     </span>
                     <span className="toast-label" title={t.label}>{t.label}</span>
                     <span className="toast-pct">
-                      {t.status === "done" ? "Done" : t.status === "error" ? "Failed" : `${pct(t.sent, t.total)}%`}
+                      {t.status === "done" ? "Done" : t.status === "error" ? "Failed" : `${pctStr(t.sent, t.total)}%`}
                     </span>
+                    {t.status === "active" && uploadCtls.current.has(t.id) && (
+                      <button className="toast-cancel" title="Cancel upload" aria-label={`Cancel upload of ${t.label}`}
+                              onClick={() => cancelActiveUpload(t.id)}>{Cross}</button>
+                    )}
                   </div>
                   {t.dest && <div className="toast-dest" title={t.dest}>→ {t.dest}</div>}
                   {t.status === "active" && (
@@ -1313,21 +1655,21 @@ export default function HomePage() {
             </div>
           )}
 
-          {resumable.length > 0 && (
+          {uploadsSynced && visibleResumable.length > 0 && (
             <div className="resumebar" role="status">
               <div className="resumebar-hd">
                 <span className="resumebar-ic" aria-hidden>{Upload}</span>
-                <span>{resumable.length === 1 ? "Interrupted upload" : `${resumable.length} interrupted uploads`}</span>
-                {resumable.length > 1 && (
+                <span>{visibleResumable.length === 1 ? "Interrupted upload" : `${visibleResumable.length} interrupted uploads`}</span>
+                {visibleResumable.length > 1 && (
                   <button className="resumebar-cancelall" onClick={cancelAllResumable}>Cancel all</button>
                 )}
               </div>
               <div className="resumebar-list">
-                {resumable.map((u) => (
+                {visibleResumable.map((u) => (
                   <div key={u.id} className="resumebar-item">
                     <div className="resumebar-info">
                       <span className="resumebar-name" title={u.name}>{u.name}</span>
-                      <span className="resumebar-meta">→ {u.dir === "." ? "/" : "/" + u.dir} · {pct(u.received, u.size)}%</span>
+                      <span className="resumebar-meta">→ {u.dir === "." ? "/" : "/" + u.dir} · {pctStr(u.received, u.size)}%</span>
                     </div>
                     <div className="resumebar-itemact">
                       <button className="resumebar-btn" onClick={() => pickResume(u)}>Resume</button>
@@ -1342,10 +1684,25 @@ export default function HomePage() {
       )}
 
       {tree && current && (
-        <div className={`fab-wrap${menuOpen ? " is-open" : ""}`}>
-          {menuOpen && <div className="fab-scrim" onClick={() => setMenuOpen(false)} />}
+        <div className={`fab-wrap${menuOpen && !isLocked ? " is-open" : ""}`}>
+          {lockKnown && isLocked && (
+            <button className="fab fab--locked" onClick={() => ensureUnlocked()} aria-label="Unlock web changes" title="Web changes are locked — click to enter the password">
+              {LockIcon}
+            </button>
+          )}
+          {lockKnown && !isLocked && menuOpen && <div className="fab-scrim" onClick={() => setMenuOpen(false)} />}
 
+          {lockKnown && !isLocked && (<>
           <div className="fab-actions">
+            {lockActive && (
+              <button
+                className="fab-action"
+                onClick={() => { setMenuOpen(false); relockDevice(); }}
+              >
+                <span className="fab-action-label">Lock web changes</span>
+                <span className="fab-action-btn">{LockIcon}</span>
+              </button>
+            )}
             <button
               className="fab-action"
               onClick={() => { setMenuOpen(false); openRunners({ add: true }); }}
@@ -1378,6 +1735,7 @@ export default function HomePage() {
           >
             <span className="fab-plus" aria-hidden>{Plus}</span>
           </button>
+          </>)}
 
           <input ref={fileInput} type="file" multiple hidden onChange={onPickFiles} />
           <input
@@ -1431,8 +1789,35 @@ export default function HomePage() {
               onClose={closeGraph}
               onCopyLink={(p, t) => copyLink(p, t)}
               onDownload={(node) => { window.location.href = node.type === "file" ? downloadUrl(node.path) : zipUrl(node.path); }}
-              onDelete={(node) => setConfirmDelete({ path: node.path, name: node.name, type: node.type })}
+              onDelete={(node) => requestDelete({ path: node.path, name: node.name, type: node.type })}
             />
+          </div>
+        </div>
+      )}
+
+      {lockModal && (
+        <div className="modal-backdrop" onClick={() => setLockModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+            <div className="modal-head">
+              <span className="modal-title">Web changes locked</span>
+              <button className="modal-close" onClick={() => setLockModal(false)} aria-label="Close">{Cross}</button>
+            </div>
+            <p className="modal-text">
+              Uploading and deleting require the upload password.
+              <br />
+              Viewing and downloading stay open.
+            </p>
+            <input
+              className="ginput mono lock-input" type="password" placeholder="upload password" autoFocus
+              value={lockPw}
+              onChange={(e) => { setLockPw(e.target.value); setLockErr(""); }}
+              onKeyDown={(e) => { if (e.key === "Enter") submitUnlock(); }}
+            />
+            {lockErr && <p className="modal-text modal-text--warn">{lockErr}</p>}
+            <div className="modal-actions">
+              <button className="mbtn mbtn--ghost" onClick={() => setLockModal(false)}>Cancel</button>
+              <button className="mbtn mbtn--go" onClick={submitUnlock}>Unlock</button>
+            </div>
           </div>
         </div>
       )}
@@ -2134,6 +2519,29 @@ const Gear = (
   </svg>
 );
 // compact disk/storage glyph for the status-bar chip
+const Eyes = (
+  <svg viewBox="0 0 16 16" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <circle cx="4.6" cy="8" r="3.1" />
+    <circle cx="11.4" cy="8" r="3.1" />
+    <circle cx="5.3" cy="8" r="1.1" fill="currentColor" stroke="none" />
+    <circle cx="12.1" cy="8" r="1.1" fill="currentColor" stroke="none" />
+  </svg>
+);
+const LockIcon = (
+  <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.4">
+    <rect x="3.2" y="7" width="9.6" height="6.4" rx="1.6" />
+    <path d="M5.4 7V5.2a2.6 2.6 0 0 1 5.2 0V7" />
+    <circle cx="8" cy="10.1" r="1" fill="currentColor" stroke="none" />
+  </svg>
+);
+const ServerIcon = (
+  <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <rect x="2.2" y="2.6" width="11.6" height="4.4" rx="1.2" />
+    <rect x="2.2" y="9" width="11.6" height="4.4" rx="1.2" />
+    <circle cx="5" cy="4.8" r="0.9" fill="currentColor" stroke="none" />
+    <circle cx="5" cy="11.2" r="0.9" fill="currentColor" stroke="none" />
+  </svg>
+);
 const Disk = (
   <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.2">
     <ellipse cx="8" cy="4" rx="5.2" ry="2.1" />
@@ -2212,7 +2620,9 @@ function xhrUpload(url: string, fd: FormData, onProgress: (loaded: number) => vo
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url);
-    if (authToken) xhr.setRequestHeader("Authorization", `Bearer ${authToken}`);
+    // same headers as every fetch (Authorization + x-upload-key) — setting them
+    // manually here is how the small-file path missed the upload lock key
+    for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded); };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -2257,14 +2667,17 @@ function clearPersistedUpload(id: string) {
 // upload one chunk with retry+backoff; returns the server's new received count.
 // onState reports "retrying" so the UI can show a reconnecting state.
 async function postChunk(
-  id: string, offset: number, buf: ArrayBuffer, sha: string, onState: (s: "ok" | "retry") => void
+  id: string, offset: number, buf: ArrayBuffer, sha: string, onState: (s: "ok" | "retry") => void,
+  key?: string
 ): Promise<number> {
   let attempt = 0;
   while (true) {
     try {
+      const h = authHeaders(sha ? { "Content-Type": "application/octet-stream", "X-Chunk-Sha256": sha } : { "Content-Type": "application/octet-stream" });
+      if (key) h["x-upload-key"] = key; // key captured at upload start — re-locking mid-upload must not break in-flight chunks
       const res = await fetch(`${UPLOAD_URL}/chunk?id=${encodeURIComponent(id)}&offset=${offset}`, {
         method: "POST",
-        headers: authHeaders(sha ? { "Content-Type": "application/octet-stream", "X-Chunk-Sha256": sha } : { "Content-Type": "application/octet-stream" }),
+        headers: h,
         body: buf,
       });
       if (res.status === 401) throw Object.assign(new Error("AUTH"), { auth: true });
@@ -2286,17 +2699,27 @@ async function postChunk(
 
 // returns {sha256} on success; throws on auth/fatal error
 async function chunkedUpload(
-  file: File, dir: string, onProgress: (sent: number, retrying: boolean) => void
+  file: File, dir: string, onProgress: (sent: number, retrying: boolean) => void,
+  ctl?: { cancelled: boolean; id: string }
 ): Promise<{ sha256: string }> {
   const key = `${file.name}|${file.size}|${file.lastModified}|${dir}`;
+  // capture the unlock key NOW: an upload authorized at start runs to completion
+  // even if the user re-locks the device mid-flight (the lock gates new writes)
+  const lockKey = uploadKey;
+  const withKey = (extra?: Record<string, string>) => {
+    const h = authHeaders(extra);
+    if (lockKey) h["x-upload-key"] = lockKey;
+    return h;
+  };
   const initRes = await fetch(`${UPLOAD_URL}/init`, {
     method: "POST",
-    headers: authHeaders({ "Content-Type": "application/json" }),
+    headers: withKey({ "Content-Type": "application/json" }),
     body: JSON.stringify({ key, name: file.name, size: file.size, dir }),
   });
   if (initRes.status === 401) throw Object.assign(new Error("AUTH"), { auth: true });
   if (!initRes.ok) throw new Error((await initRes.text()) || `HTTP ${initRes.status}`);
   const { id, received } = await initRes.json();
+  if (ctl) ctl.id = id; // so a cancel can tell the hub to drop the partial
 
   let offset: number = received || 0;
   const persist = () => persistUpload({ id, name: file.name, size: file.size, dir, lastModified: file.lastModified, received: offset });
@@ -2304,17 +2727,18 @@ async function chunkedUpload(
   onProgress(offset, false);
 
   while (offset < file.size) {
+    if (ctl?.cancelled) throw Object.assign(new Error("cancelled"), { cancelled: true });
     const end = Math.min(offset + CHUNK_SIZE, file.size);
     const buf = await file.slice(offset, end).arrayBuffer();
     const sha = await sha256Hex(buf);
-    offset = await postChunk(id, offset, buf, sha, (s) => onProgress(offset, s === "retry"));
+    offset = await postChunk(id, offset, buf, sha, (s) => onProgress(offset, s === "retry"), lockKey);
     persist();
     onProgress(offset, false);
   }
 
   const finRes = await fetch(`${UPLOAD_URL}/finish?id=${encodeURIComponent(id)}`, {
     method: "POST",
-    headers: authHeaders({ "Content-Type": "application/json" }),
+    headers: withKey({ "Content-Type": "application/json" }),
     body: JSON.stringify({}),
   });
   if (finRes.status === 401) throw Object.assign(new Error("AUTH"), { auth: true });
@@ -2326,7 +2750,12 @@ async function chunkedUpload(
 
 function pct(sent: number, total: number): number {
   if (total <= 0) return 0;
-  return Math.min(100, Math.round((sent / total) * 100));
+  return Math.min(100, (sent / total) * 100);
+}
+// upload progress display: three decimals so huge files show visible movement
+// (on a 300 GB file, 0.001% is ~3 MB — whole percents sit still for minutes)
+function pctStr(sent: number, total: number): string {
+  return pct(sent, total).toFixed(3);
 }
 function relTime(ts: number | null): string {
   if (!ts) return "never";
@@ -2418,6 +2847,9 @@ function pathExists(root: TreeNode, path: string): boolean {
     node = child;
   }
   return !!node;
+}
+function shortPath(p: string) {
+  return p.length > 34 ? "…" + p.slice(-33) : p;
 }
 function shortHash(h: string) {
   return h ? h.slice(0, 7) : "·······";
@@ -2647,6 +3079,9 @@ const CSS = `
 .fab:active { transform: scale(0.94); }
 .fab-plus { display: grid; place-items: center; transition: transform .22s ease; }
 .fab-wrap.is-open .fab-plus { transform: rotate(135deg); }
+.lock-input { display: block; width: 100%; box-sizing: border-box; margin-bottom: 16px; }
+.fab--locked { display: grid; place-items: center; }
+.fab--locked svg { width: 20px; height: 20px; }
 
 .fab-actions {
   display: flex; flex-direction: column; align-items: flex-end; gap: 12px;
@@ -2721,6 +3156,7 @@ const CSS = `
 .graph-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--muted); font-size: 13px; cursor: default; }
 .graph-spinner { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border-strong); border-top-color: var(--accent); animation: graph-spin .7s linear infinite; }
 @keyframes graph-spin { to { transform: rotate(360deg); } }
+.empty-spinner { width: 26px; height: 26px; border-width: 2.5px; }
 .graph-svg { width: 100%; height: 100%; display: block; }
 
 /* teal links: parent → children, drawn in hash (left-to-right) order */
@@ -3075,6 +3511,9 @@ const CSS = `
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .toast-pct { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); flex: 0 0 auto; }
+.toast-cancel { display: grid; place-items: center; width: 20px; height: 20px; flex: 0 0 auto; border: none; background: transparent; border-radius: 5px; color: var(--muted); cursor: pointer; transition: color .12s, background .12s; }
+.toast-cancel svg { width: 10px; height: 10px; }
+.toast-cancel:hover { color: #E0584F; background: rgba(224,88,79,0.12); }
 .toast--done .toast-pct { color: var(--accent); }
 .toast--error .toast-pct { color: #E0584F; }
 .toast-dest {
@@ -3149,7 +3588,7 @@ const CSS = `
   font-family: var(--font-sans); color: var(--text); position: relative;
 }
 button.row { appearance: none; cursor: pointer; }
-.row:hover { background: var(--panel); }
+.row:hover { background: var(--accent-dim); }
 
 .cell-name { display: flex; align-items: center; gap: 11px; min-width: 0; }
 .file-link, .folder-link { text-decoration: none; color: inherit; cursor: pointer; }
@@ -3249,6 +3688,45 @@ button.row { appearance: none; cursor: pointer; }
 }
 
 /* status bar */
+/* watcher helmet: quiet icon, state shown by tint; hover for the short log */
+.sb-watcher { position: relative; display: inline-flex; align-items: center; outline: none; }
+/* the sticky statusbar's z-index (10) traps its children below the upload
+   toasts/resume stack (z 90); lift it above while ANY of its popovers is open
+   (watcher eyes, server log, storage chip) */
+.statusbar:has(.sb-watcher:hover), .statusbar:has(.sb-watcher:focus-visible),
+.statusbar:has(.sb-hub:hover), .statusbar:has(.sb-hub:focus-visible),
+.statusbar:has(.sb-disk:hover), .statusbar:has(.sb-disk:focus-visible) { z-index: 95; }
+/* hub event log: same quiet-icon + hover-popover pattern as the watcher */
+.sb-hub { position: relative; display: inline-flex; align-items: center; outline: none; }
+.sb-hub-ic { display: grid; place-items: center; color: var(--muted); cursor: default; }
+.sb-hub.is-err .sb-hub-ic { color: #E0584F; }
+.sb-hub-pop {
+  position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%) translateY(4px);
+  display: flex; flex-direction: column; gap: 6px; width: 280px; padding: 10px 11px;
+  background: rgba(8,11,10,0.97); border: 1px solid var(--border-strong); border-radius: 9px;
+  box-shadow: 0 14px 36px -12px rgba(0,0,0,0.8); backdrop-filter: blur(10px);
+  opacity: 0; pointer-events: none; transition: opacity .14s, transform .14s; z-index: 30;
+}
+.sb-hub:hover .sb-hub-pop, .sb-hub:focus-visible .sb-hub-pop { opacity: 1; transform: translateX(-50%) translateY(0); }
+.sb-hlog--warn .sb-wlog-d { color: #E8B84B; }
+.sb-hlog--error .sb-wlog-d { color: #E0584F; }
+.sb-watcher-ic { display: grid; place-items: center; color: var(--faint); cursor: default; }
+.sb-watcher.is-idle .sb-watcher-ic { color: var(--muted); }
+.sb-watcher.is-hashing .sb-watcher-ic, .sb-watcher.is-scanning .sb-watcher-ic { color: #FFD43B; animation: watcher-blink 1s ease-in-out infinite; }
+.sb-watcher.is-reconciling .sb-watcher-ic { color: #4DABF7; animation: watcher-blink 1s ease-in-out infinite; }
+@keyframes watcher-blink { 50% { opacity: 0.4; } }
+.sb-watcher-pop {
+  position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%) translateY(4px);
+  display: flex; flex-direction: column; gap: 6px; width: 250px; padding: 10px 11px;
+  background: rgba(8,11,10,0.97); border: 1px solid var(--border-strong); border-radius: 9px;
+  box-shadow: 0 14px 36px -12px rgba(0,0,0,0.8); backdrop-filter: blur(10px);
+  opacity: 0; pointer-events: none; transition: opacity .14s, transform .14s; z-index: 30;
+}
+.sb-watcher:hover .sb-watcher-pop, .sb-watcher:focus-visible .sb-watcher-pop { opacity: 1; transform: translateX(-50%) translateY(0); }
+.sb-wlog-line { display: flex; align-items: baseline; gap: 8px; font-size: 10.5px; min-width: 0; }
+.sb-wlog-t { color: var(--faint); flex: 0 0 auto; }
+.sb-wlog-s { color: var(--text); flex: 0 0 auto; }
+.sb-wlog-d { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .statusbar {
   display: flex; align-items: center; gap: 18px;
   padding: 8px 22px; border-top: 1px solid var(--border);
