@@ -48,8 +48,8 @@ for dep in sha256sum python3; do
 done
 
 # The hashing itself is done in python3 (present on any stock Ubuntu/WSL box):
-# a shell-only version can't reproduce Go's JSON escaping or handle newlines in
-# filenames safely, and getting those wrong silently changes the hash.
+# a shell-only version can't safely handle filenames containing newlines or
+# other unusual bytes, and getting that wrong silently changes the hash.
 python3 - "$ROOT" "$TREE" "$JSON" <<'PY'
 import hashlib, json, os, sys
 
