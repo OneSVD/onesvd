@@ -58,6 +58,7 @@ hub_port: $DEF_HUB_PORT
 ingest_port: $DEF_INGEST_PORT
 frontend_port: $DEF_FRONTEND_PORT
 frontend_mode: $DEF_FRONTEND_MODE
+upload_lock_hash: $DEF_UPLOAD_LOCK_HASH
 EOF
   ok "wrote config $CONFIG_FILE"
   info "watching: $wd  ${c_dim}(change with: onesvd dir <path>)${c_off}"
@@ -230,6 +231,7 @@ Environment=ONESVD_ROOT=$watch_dir
 Environment=ONESVD_HUB_PORT=$hub_port
 Environment=ONESVD_INGEST_PORT=$ingest_port
 Environment=NEXT_PUBLIC_ONESVD_HUB_PORT=$hub_port
+Environment=ONESVD_UPLOAD_LOCK=$(cval upload_lock_hash "")
 ExecStart=$node $HUB_DIR/server.js
 Restart=on-failure
 RestartSec=2
@@ -388,9 +390,35 @@ choose_watch_dir() {
   ok "watching: $DEF_WATCH_DIR"
 }
 
+# first-run: optional upload lock. When enabled, uploading and deleting from the
+# web UI require this password; viewing, downloading, and zipping stay open.
+# Only the sha256 of the password is stored — never the password itself.
+DEF_UPLOAD_LOCK_HASH=""
+choose_upload_lock() {
+  [ -e /dev/tty ] || return 0   # no terminal → lock stays off
+
+  local ans=""
+  printf "  Enable upload lock? Uploading/deleting will require a password. [y/N] "
+  if ! read -r ans < /dev/tty 2>/dev/null; then echo; return 0; fi
+  case "$ans" in [yY]*) ;; *) return 0 ;; esac
+
+  local pw1 pw2
+  while :; do
+    printf "  Upload password: "
+    read -rs pw1 < /dev/tty 2>/dev/null; echo
+    printf "  Retype password: "
+    read -rs pw2 < /dev/tty 2>/dev/null; echo
+    if [ -z "$pw1" ]; then warn "empty password — upload lock disabled"; return 0; fi
+    if [ "$pw1" = "$pw2" ]; then break; fi
+    warn "passwords do not match — try again (empty to skip)"
+  done
+  DEF_UPLOAD_LOCK_HASH="$(printf '%s' "$pw1" | sha256sum | cut -d' ' -f1)"
+  ok "upload lock enabled"
+}
+
 cmd_up() {
   require_systemd
-  [ -f "$CONFIG_FILE" ] || choose_watch_dir   # first run: confirm the watched dir
+  [ -f "$CONFIG_FILE" ] || { choose_watch_dir; choose_upload_lock; }   # first run: watched dir + optional upload lock
   ensure_config
   build_if_needed
   [ -x "$WATCHER_DIR/onesvd-watcher" ] || die "watcher not built — run: onesvd build"
