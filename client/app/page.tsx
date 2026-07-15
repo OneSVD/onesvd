@@ -1838,8 +1838,9 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
     return { matches, relevant };
   }, [q, tree, version]);
 
-  // layout: only render root + expanded subtrees. Children stay in received (hash)
-  // order — never re-sorted — so left-to-right IS the order they're hashed.
+  // layout: only render root + expanded subtrees. Children stay in received
+  // order — the worker emits them in ascending child-hash order, the exact order
+  // they're folded into the parent's hash — so left-to-right IS the hashing order.
   const built = useMemo(() => {
     if (!ready) return null;
     const nodes: GNode[] = [];
@@ -2448,16 +2449,16 @@ function count(n: TreeNode): { files: number; dirs: number; bytes: number } {
   }
   return { files, dirs, bytes };
 }
-// Match the Go worker's child ordering exactly: it hashes children in
-// sort.Strings order — a byte-wise (UTF-8) comparison of the names, NOT locale
-// order. Keeping the maintained tree in this order means the graph's left-to-right
-// layout is the true order each child folds into its parent's hash.
-const _nameEnc = new TextEncoder();
+// Match the Go worker's child ordering exactly: a directory folds its children
+// into its own hash in ASCENDING CHILD-HASH order (fixed-width hex, so plain
+// string comparison IS the numeric comparison). Ties — duplicate content —
+// break by name, mirroring the worker's sortedChildren. Keeping the maintained
+// tree in this order means the graph's left-to-right layout is the true order
+// each child folds into its parent's hash.
 function byHashOrder(a: TreeNode, b: TreeNode): number {
-  const ab = _nameEnc.encode(a.name), bb = _nameEnc.encode(b.name);
-  const n = Math.min(ab.length, bb.length);
-  for (let i = 0; i < n; i++) if (ab[i] !== bb[i]) return ab[i] - bb[i];
-  return ab.length - bb.length;
+  const ah = a.sha256 || "", bh = b.sha256 || "";
+  if (ah !== bh) return ah < bh ? -1 : 1;
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 }
 function applyPatch(root: TreeNode, changes: Change[]): TreeNode {
   let next = root;
