@@ -82,11 +82,6 @@ type Node struct {
 	children map[string]*Node
 }
 
-type ChildRecord struct {
-	Name   string `json:"name"`
-	Type   string `json:"type"`
-	SHA256 string `json:"sha256"`
-}
 
 type NodeWire struct {
 	Name     string      `json:"name"`
@@ -219,31 +214,48 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func sortedChildNames(n *Node) []string {
-	names := make([]string, 0, len(n.children))
-	for nm := range n.children {
-		names = append(names, nm)
+// sortedChildren returns a directory's children in ascending hash order — the
+// exact order recomputeDirHash folds them into the parent's hash. The wire uses
+// this order so the UI's left-to-right layout is the true hashing order.
+// Ties (identical hashes, i.e. duplicate content) break by name for determinism.
+func sortedChildren(n *Node) []*Node {
+	kids := make([]*Node, 0, len(n.children))
+	for _, c := range n.children {
+		kids = append(kids, c)
 	}
-	sort.Strings(names)
-	return names
+	sort.Slice(kids, func(i, j int) bool {
+		if kids[i].sha256 != kids[j].sha256 {
+			return kids[i].sha256 < kids[j].sha256
+		}
+		return kids[i].name < kids[j].name
+	})
+	return kids
 }
 
+// recomputeDirHash: a directory's hash is the sha256 of its children's hashes
+// sorted ascending and concatenated. sha256 hex strings are fixed-width, so
+// numeric order and string order coincide — sort.Strings IS the numeric sort.
+// Names and types are NOT part of the preimage: the hash identifies content only,
+// so renaming a file (or moving it between siblings of the same parent) does not
+// change the parent's hash. Duplicate children contribute once each (multiset).
 func recomputeDirHash(n *Node) {
-	var list []ChildRecord
-	for _, nm := range sortedChildNames(n) {
-		c := n.children[nm]
-		list = append(list, ChildRecord{Name: c.name, Type: c.kind, SHA256: c.sha256})
+	hashes := make([]string, 0, len(n.children))
+	for _, c := range n.children {
+		hashes = append(hashes, c.sha256)
 	}
-	b, _ := json.Marshal(list)
-	sum := sha256.Sum256(b)
-	n.sha256 = hex.EncodeToString(sum[:])
+	sort.Strings(hashes)
+	h := sha256.New()
+	for _, hs := range hashes {
+		_, _ = h.Write([]byte(hs))
+	}
+	n.sha256 = hex.EncodeToString(h.Sum(nil))
 }
 
 func toWire(n *Node) *NodeWire {
 	w := &NodeWire{Name: n.name, Path: n.path, Type: n.kind, SHA256: n.sha256, Size: n.size, MTime: n.mtime}
 	if n.kind == "directory" {
-		for _, nm := range sortedChildNames(n) {
-			w.Children = append(w.Children, toWire(n.children[nm]))
+		for _, c := range sortedChildren(n) {
+			w.Children = append(w.Children, toWire(c))
 		}
 	}
 	return w
