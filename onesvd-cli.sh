@@ -545,6 +545,18 @@ cmd_config() {
   esac
 }
 
+cmd_hash() {
+  local script="$ONESVD_HOME/onesvd-hash.sh"
+  [ -f "$script" ] || die "onesvd-hash.sh not found in $ONESVD_HOME — update your install"
+  # no folder given (flags only, or nothing) → default to the watched directory
+  local has_dir=0 a
+  for a in "$@"; do case "$a" in -*) ;; *) has_dir=1 ;; esac; done
+  if [ "$has_dir" = 0 ]; then
+    set -- "$@" "$(cval watch_dir "$DEF_WATCH_DIR")"
+  fi
+  bash "$script" "$@"
+}
+
 cmd_version() {
   local v="dev"
   if have git && [ -d "$ONESVD_HOME/.git" ]; then
@@ -568,6 +580,7 @@ usage: onesvd <command> [args]
   config                   print the current config
   config get <key>         print one config value
   config set <key> <val>   change a config value (restarts if running)
+  hash [-t|-j] [PATH]      compute the Merkle root of PATH (default: watched dir)
   uninstall                stop + remove services (config + data kept)
   version                  print version
   help                     show this help
@@ -590,6 +603,7 @@ case "$ACTION" in
   build)              cmd_build ;;
   dir)                cmd_dir "$@" ;;
   config)             cmd_config "$@" ;;
+  hash)               cmd_hash "$@" ;;
   uninstall)          cmd_uninstall ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help)     cmd_help ;;
