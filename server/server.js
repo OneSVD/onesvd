@@ -248,11 +248,17 @@ let tree = null; // mirror root
 // makes the Go watcher resync. The watcher remains the source of truth: when it
 // next sends a snapshot or an in-sequence patch, this is overwritten/updated.
 const TREE_FILE = path.join(__dirname, "tree.json"); // outside ROOT
+// identity of the vault this tree describes. A reinstall pointed at a NEW path
+// must not serve the OLD path's persisted tree as truth — the id makes stale
+// state self-invalidating, here and in the client's cache.
+const ROOT_ID = crypto.createHash("sha256").update(ROOT).digest("hex").slice(0, 16);
 let treeSaveTimer = null;
 function loadTree() {
   try {
     const saved = JSON.parse(fs.readFileSync(TREE_FILE, "utf8"));
-    if (saved && saved.tree) {
+    if (saved && saved.tree && saved.rootId !== ROOT_ID) {
+      console.log("tree: discarding persisted tree — it describes a different root");
+    } else if (saved && saved.tree) {
       tree = saved.tree;
       version = typeof saved.version === "number" ? saved.version : 0;
       console.log(`tree: loaded last-known (version ${version})`);
@@ -261,7 +267,7 @@ function loadTree() {
 }
 function saveTreeNow() {
   try {
-    if (tree) fs.writeFileSync(TREE_FILE, JSON.stringify({ version, tree }));
+    if (tree) fs.writeFileSync(TREE_FILE, JSON.stringify({ version, tree, rootId: ROOT_ID }));
   } catch (e) {
     console.error("saveTree:", e);
   }
@@ -276,7 +282,7 @@ function saveTreeAsync() {
   if (!tree) return;
   if (treeSaving) { treeSaveAgain = true; return; }
   treeSaving = true;
-  const body = JSON.stringify({ version, tree });
+  const body = JSON.stringify({ version, tree, rootId: ROOT_ID });
   fs.writeFile(TREE_FILE, body, (e) => {
     treeSaving = false;
     if (e) console.error("saveTree:", e);
@@ -337,6 +343,16 @@ function applyChange(root, c) {
 let watcherStatus = { state: "starting", detail: "", at: 0 };
 
 function handleIngest(msg) {
+  if (msg.kind === "lane") {
+    // per-lane "currently hashing" — transient relay like hashprog
+    broadcast({ kind: "lane", lane: String(msg.lane || ""), path: String(msg.path || "") });
+    return;
+  }
+  if (msg.kind === "hashprog") {
+    // transient per-file hashing progress — relay only, nothing to remember
+    broadcast({ kind: "hashprog", path: String(msg.path || ""), done: Number(msg.done) || 0, size: Number(msg.size) || 0 });
+    return;
+  }
   if (msg.kind === "status") {
     // watcher telemetry: what the daemon is actively doing (scanning/hashing/
     // reconciling/idle). Remember it for new connections and relay to everyone.
@@ -760,7 +776,11 @@ function handleZip(req, res) {
   });
 
   if (archiverFn) {
-    const archive = archiverFn("zip", { zlib: { level: 6 } });
+    // store-only (no compression): the vault holds mostly already-compressed
+    // artifacts, and DEFLATE at level 6 is single-threaded CPU work that turns
+    // a multi-hundred-GB folder into hours of zipping. At level 0 the zip
+    // streams at disk/network speed; integrity comes from the hashes anyway.
+    const archive = archiverFn("zip", { zlib: { level: 0 } });
     archive.on("error", (e) => { console.error("zip(archiver) error:", e); try { res.destroy(); } catch {} });
     archive.pipe(res);
     archive.directory(target, folder); // nest under the folder name
@@ -768,7 +788,7 @@ function handleZip(req, res) {
   } else {
     // system zip: run from the parent so the archive nests under `folder`
     // -r recurse, -q quiet, - write to stdout
-    const zip = spawn("zip", ["-r", "-q", "-", folder], { cwd: path.dirname(target) });
+    const zip = spawn("zip", ["-0", "-r", "-q", "-", folder], { cwd: path.dirname(target) }); // -0 = store-only, same reasoning as archiver
     zip.stdout.pipe(res);
     zip.stderr.on("data", (d) => console.error("zip:", d.toString()));
     zip.on("error", (e) => { console.error("zip spawn error:", e); try { res.destroy(); } catch {} });
@@ -1703,6 +1723,7 @@ wss.on("connection", (ws, req) => {
   // small state first: these are bytes, the snapshot is tens of MB. Sending the
   // snapshot first made the lock/uploads/resume UI wait behind its stringify,
   // transfer, and parse — the client can act on these instantly instead.
+  ws.send(JSON.stringify({ kind: "root", id: ROOT_ID }));
   ws.send(JSON.stringify({ kind: "lock", locked: UPLOAD_LOCK !== "" }));
   ws.send(JSON.stringify({ kind: "uploads", uploads: publicUploads() }));
   ws.send(JSON.stringify({ kind: "runners", runners: runners.map(publicRunner) }));
