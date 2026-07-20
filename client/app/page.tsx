@@ -126,6 +126,9 @@ type Msg =
   | { kind: "watcher"; state: string; detail: string; at: number }
   | { kind: "hublog"; lines: HubEvent[] }
   | { kind: "lock"; locked: boolean }
+  | { kind: "root"; id: string }
+  | { kind: "hashprog"; path: string; done: number; size: number }
+  | { kind: "lane"; lane: string; path: string }
   | { kind: "disk"; disk: { total: number; free: number; used: number; quota: boolean } };
 type HubEvent = { at: number; level: "info" | "warn" | "error"; line: string };
 type RemoteUpload = {
@@ -186,6 +189,9 @@ export default function HomePage() {
   const [lockModal, setLockModal] = useState(false);
   const [lockPw, setLockPw] = useState("");
   const [lockErr, setLockErr] = useState("");
+  const [infoMenuFor, setInfoMenuFor] = useState<string | null>(null); // node.path with the CSV/JSON export menu open
+  const [hashProg, setHashProg] = useState<Map<string, { done: number; size: number; at: number }>>(new Map()); // per-file hashing progress
+  const [lanes, setLanes] = useState<Map<string, { path: string; at: number }>>(new Map()); // per-lane current file (large/small hasher)
   const [uploadsSynced, setUploadsSynced] = useState(false); // first uploads broadcast received
   const [nowTick, setNowTick] = useState(() => Date.now()); // drives staleness re-evaluation
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -358,11 +364,19 @@ export default function HomePage() {
   // (stale-while-revalidate: the hub's live snapshot on ws connect replaces it,
   // and subsequent patches keep it current — sync happens naturally)
   const gotLiveTree = useRef(false);
+  const [liveTreeSeen, setLiveTreeSeen] = useState(false); // render-safe: a live snapshot has replaced any cache
+  const cachedRootId = useRef<string>("");   // id stamped on the hydrated cache
+  const hydratedFromCache = useRef(false);   // a cached tree is currently displayed
+  const liveRootId = useRef<string>("");     // id the connected hub reports
   const [cacheChecked, setCacheChecked] = useState(false); // the IDB read settled (hit or miss)
   const [slowWait, setSlowWait] = useState(false);         // no tree for a long time — show the full message
   useEffect(() => {
-    idbGet<{ version: number; tree: TreeNode }>("tree").then((cached) => {
+    idbGet<{ version: number; tree: TreeNode; rootId?: string }>("tree").then((cached) => {
       if (cached && !gotLiveTree.current) { // a fresh snapshot may beat the cache read
+        // if the hub already told us its root and the cache is from another one, skip it
+        if (liveRootId.current && cached.rootId && cached.rootId !== liveRootId.current) return;
+        cachedRootId.current = cached.rootId || "";
+        hydratedFromCache.current = true;
         setTree((prev) => prev ?? cached.tree);
         setVersion((v) => v || cached.version);
       }
@@ -377,8 +391,8 @@ export default function HomePage() {
   // persist the current tree (debounced — patches arrive in bursts) so the next
   // load can render immediately
   useEffect(() => {
-    if (!tree) return;
-    const t = setTimeout(() => { idbSet("tree", { version, tree }); }, 3000);
+    if (!tree || !gotLiveTree.current || !liveRootId.current) return; // never re-persist a cache or an unidentified tree
+    const t = setTimeout(() => { idbSet("tree", { version, tree, rootId: liveRootId.current }); }, 3000);
     return () => clearTimeout(t);
   }, [tree, version]);
 
@@ -463,6 +477,38 @@ export default function HomePage() {
           setHubLog(msg.lines);
           return;
         }
+        if (msg.kind === "lane") {
+          setLanes((m) => {
+            const next = new Map(m);
+            if (msg.path) next.set(msg.lane, { path: msg.path, at: Date.now() });
+            else next.delete(msg.lane); // lane drained
+            return next;
+          });
+          return;
+        }
+        if (msg.kind === "hashprog") {
+          setHashProg((m) => {
+            const now = Date.now();
+            const next = new Map<string, { done: number; size: number; at: number }>();
+            for (const [p, v] of m) if (now - v.at < 30000) next.set(p, v); // drop stale
+            next.set(msg.path, { done: msg.done, size: msg.size, at: now });
+            return next;
+          });
+          return;
+        }
+        if (msg.kind === "root") {
+          liveRootId.current = msg.id;
+          if (!gotLiveTree.current && hydratedFromCache.current && cachedRootId.current !== msg.id) {
+            // the hydrated cache describes a different vault (reinstall on a new
+            // path): drop it and wait for the real snapshot instead of lying
+            cachedRootId.current = "";
+            hydratedFromCache.current = false;
+            setTree(null);
+            setVersion(0);
+            idbSet("tree", null);
+          }
+          return;
+        }
         if (msg.kind === "lock") {
           setLockActive(msg.locked);
           if (!msg.locked) {
@@ -532,6 +578,7 @@ export default function HomePage() {
         }
         if (msg.kind === "snapshot") {
           gotLiveTree.current = true;
+          setLiveTreeSeen(true);
           setTree(msg.tree);
           setVersion(msg.version);
           setRecalc(new Set());
@@ -647,6 +694,34 @@ export default function HomePage() {
   }, [remoteUploads, resumable]);
 
   const current = tree ? nodeAt(tree, cwd) : null;
+
+  // rollup progress for visible directories whose hash is still unknown;
+  // recomputed only when the listing itself changes (patches replace nodes)
+  // recursive byte total per visible directory (sum of descendant file sizes),
+  // memoized per listing like the hash rollup
+  const dirBytes = useMemo(() => {
+    const m = new Map<string, number>();
+    if (!current) return m;
+    const sum = (n: TreeNode): number => {
+      if (n.type === "file") return n.size ?? 0;
+      let b = 0;
+      for (const c of n.children ?? []) b += sum(c);
+      return b;
+    };
+    for (const c of current.children ?? []) {
+      if (c.type === "directory") m.set(c.path, sum(c));
+    }
+    return m;
+  }, [current]);
+
+  const dirFill = useMemo(() => {
+    const m = new Map<string, { done: number; total: number }>();
+    if (!current) return m;
+    for (const c of current.children ?? []) {
+      if (c.type === "directory" && c.sha256 === "") m.set(c.path, countFileFill(c));
+    }
+    return m;
+  }, [current]);
   const items = useMemo(() => {
     const c = current?.children ?? [];
     const real = [...c]
@@ -873,6 +948,37 @@ export default function HomePage() {
     pushToast(ok ? "Link copied" : "Couldn't copy link", ok ? "done" : "error");
   };
 
+  const copyHash = async (node: TreeNode) => {
+    if (!node.sha256) return; // nothing definite to copy yet
+    const ok = await copyTextToClipboard(node.sha256);
+    pushToast(ok ? "Hash copied" : "Couldn't copy hash", ok ? "done" : "error");
+  };
+
+  // single-node info export (CSV or JSON) for files and directories alike:
+  // name, path, type, size, sha256
+  const downloadFileInfo = (node: TreeNode, fmt: "csv" | "json") => {
+    let body: string, mime: string;
+    if (fmt === "csv") {
+      const esc = (v: unknown) => `"${String(v).replace(/"/g, '""')}"`;
+      body = [
+        "name,path,type,size_bytes,sha256",
+        [node.name, node.path, node.type, node.size ?? 0, node.sha256].map(esc).join(","),
+      ].join("\n") + "\n";
+      mime = "text/csv";
+    } else {
+      body = JSON.stringify({ name: node.name, path: node.path, type: node.type, size_bytes: node.size ?? 0, sha256: node.sha256 }, null, 2) + "\n";
+      mime = "application/json";
+    }
+    const blob = new Blob([body], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${node.name}.onesvd.${fmt}`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setInfoMenuFor(null);
+  };
+
   // git runners "managed by" a directory: those that build into it (destination
   // at or below the path) or have written artifacts inside it. Deleting the
   // folder should take these runners with it so they don't keep rebuilding a
@@ -919,6 +1025,28 @@ export default function HomePage() {
   // Build a CSV of a folder's full (recursive) structure: path, type, hash, size.
   // For files that a git runner produced, include the repo + the commit they were
   // built from + when. Generated entirely client-side from the live tree.
+  // structure JSON: SAME shape as `onesvd-hash.sh -j <folder>` — root hash plus
+  // every node with a path relative to the exported folder, sorted by path — so
+  // a UI export and a script run against a copy are directly diffable.
+  const exportFolderJson = (root: TreeNode) => {
+    const nodes: { path: string; type: "file" | "directory"; sha256: string }[] = [];
+    const relOf = (p: string) => (p === root.path ? "." : p.slice(root.path === "." ? 0 : root.path.length + 1));
+    const walk = (n: TreeNode) => {
+      nodes.push({ path: relOf(n.path), type: n.type, sha256: n.sha256 });
+      for (const c of n.children ?? []) walk(c);
+    };
+    walk(root);
+    nodes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const body = JSON.stringify({ root: root.sha256, nodes }, null, 2) + "\n";
+    const blob = new Blob([body], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${root.name || "root"}.structure.onesvd.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const exportFolderCsv = (root: TreeNode) => {
     const esc = (v: string | number) => {
       const s = String(v ?? "");
@@ -991,22 +1119,39 @@ export default function HomePage() {
       >
         {Download}
       </a>
-      {cwd === "." && node.type === "directory" && (
-        <button
-          className="act-btn"
-          title="Export structure as CSV"
-          aria-label={`Export ${node.name} structure as CSV`}
-          onClick={() => exportFolderCsv(node)}
-        >
-          {CsvIcon}
-        </button>
-      )}
-      {cwd === "." && node.type === "file" && (
-        // placeholder so file rows line up with the folders' CSV-export column
-        <span className="act-btn act-placeholder" aria-hidden title="Structure export is available on folders">
-          {CsvIcon}
-        </span>
-      )}
+      <span className="info-export">
+          <button
+            className="act-btn" title="Download info (CSV or JSON)"
+            aria-label={`Download info for ${node.name}`} aria-expanded={infoMenuFor === node.path}
+            onClick={() => setInfoMenuFor((cur) => (cur === node.path ? null : node.path))}
+          >
+            {CsvIcon}
+          </button>
+          {infoMenuFor === node.path && (
+            <>
+              <span className="info-export-scrim" onClick={() => setInfoMenuFor(null)} />
+              <span className="info-export-menu" role="menu">
+                <span className="info-export-head" title={node.path}>{node.name}</span>
+                {node.sha256 === "" && (
+                  <span className="info-export-warn">
+                    Hashing in progress — exported hashes will be incomplete. Please wait.
+                  </span>
+                )}
+                {node.type === "file" ? (
+                  <>
+                    <button className="info-export-opt" role="menuitem" onClick={() => downloadFileInfo(node, "csv")}>CSV</button>
+                    <button className="info-export-opt" role="menuitem" onClick={() => downloadFileInfo(node, "json")}>JSON</button>
+                  </>
+                ) : (
+                  <>
+                    <button className="info-export-opt" role="menuitem" onClick={() => { exportFolderCsv(node); setInfoMenuFor(null); }}>Structure CSV</button>
+                    <button className="info-export-opt" role="menuitem" onClick={() => { exportFolderJson(node); setInfoMenuFor(null); }}>Structure JSON</button>
+                  </>
+                )}
+              </span>
+            </>
+          )}
+      </span>
     </span>
   );
 
@@ -1358,7 +1503,7 @@ export default function HomePage() {
                   title={i === 0 && c.sha256 ? `${c.name} — ${c.sha256}` : c.name}
                 >
                   <span className="crumb-name">{c.name}</span>
-                  {i === 0 && c.sha256 && <span className="crumb-hash">{shortHash(c.sha256)}</span>}
+                  {i === 0 && c.sha256 && <span className="crumb-hash">{hashDots(c.sha256)}</span>}
                 </button>
               </span>
             ))}
@@ -1376,7 +1521,7 @@ export default function HomePage() {
               <span className="fp-dot" aria-hidden />
               <span className="fp-label">root</span>
               <span className="fp-hash">
-                {recalc.has(".") ? "recalculating" : shortHash(tree.sha256)}
+                {recalc.has(".") ? "recalculating" : hashDots(tree.sha256)}
               </span>
             </button>
           )}
@@ -1468,15 +1613,25 @@ export default function HomePage() {
                           )}
                         </button>
                       )}
-                      <span className="col-size meta">
-                        {isGhost ? "" : `${node.children?.length ?? 0} ${(node.children?.length ?? 0) === 1 ? "item" : "items"}`}
+                      <span className="col-size meta" title={isGhost ? undefined : `${(dirBytes.get(node.path) ?? 0).toLocaleString()} bytes`}>
+                        {isGhost ? "" : `${node.children?.length ?? 0} ${(node.children?.length ?? 0) === 1 ? "item" : "items"} · ${formatBytes(dirBytes.get(node.path) ?? 0)}`}
                       </span>
                       {isGhost ? (
                         <span className="col-hash hash recalc"><span className="recalc-spin" />{p!.status === "uploading" ? (p!.pct != null ? `uploading · ${p!.pct.toFixed(3)}%` : "uploading") : "processing"}</span>
                       ) : recalc.has(node.path) ? (
                         <span className="col-hash hash recalc"><span className="recalc-spin" />recalculating</span>
+                      ) : node.sha256 === "" && (dirFill.get(node.path)?.total ?? 0) > 0 ? (
+                        <span className="col-hash hash recalc"><span className="recalc-spin" />
+                          {liveTreeSeen
+                            ? `hashing · ${((dirFill.get(node.path)!.done / Math.max(1, dirFill.get(node.path)!.total)) * 100).toFixed(2)}%`
+                            : "hashing …"}
+                        </span>
                       ) : (
-                        <code className="col-hash hash">{hashDots(node.sha256)}</code>
+                        <code
+                          className={`col-hash hash${node.sha256 ? " hash-copy" : ""}`}
+                          title={node.sha256 ? `${node.sha256}\u000a(click to copy)` : undefined}
+                          onClick={() => copyHash(node)}
+                        >{hashDots(node.sha256)}</code>
                       )}
                       {isGhost ? <span className="col-act" /> : renderActions(node)}
                     </div>
@@ -1524,8 +1679,16 @@ export default function HomePage() {
                       <span className="col-hash hash recalc"><span className="recalc-spin" />{p!.status === "uploading" ? (p!.pct != null ? `uploading · ${p!.pct.toFixed(3)}%` : "uploading") : "processing"}</span>
                     ) : recalc.has(node.path) ? (
                       <span className="col-hash hash recalc"><span className="recalc-spin" />recalculating</span>
+                    ) : node.sha256 === "" && hashProg.get(node.path) && nowTick - hashProg.get(node.path)!.at < 5000 ? (
+                      <span className="col-hash hash recalc"><span className="recalc-spin" />
+                        {`hashing · ${((hashProg.get(node.path)!.done / Math.max(1, hashProg.get(node.path)!.size)) * 100).toFixed(2)}%`}
+                      </span>
                     ) : (
-                      <code className="col-hash hash">{hashDots(node.sha256)}</code>
+                      <code
+                          className={`col-hash hash${node.sha256 ? " hash-copy" : ""}`}
+                          title={node.sha256 ? `${node.sha256}\u000a(click to copy)` : undefined}
+                          onClick={() => copyHash(node)}
+                        >{hashDots(node.sha256)}</code>
                     )}
                     {isGhost ? <span className="col-act" /> : renderActions(node)}
                   </div>
@@ -1575,6 +1738,36 @@ export default function HomePage() {
                 <span className="sb-watcher-ic" aria-hidden>{Eyes}</span>
                 <span className="sb-watcher-pop" role="tooltip">
                   <span className="sb-pop-row"><span className="sb-pop-k">Watcher</span><span className="sb-pop-v">{watcher.state}</span></span>
+                  {(() => {
+                    // pinned "actively hashing" lines: one per lane, plus any
+                    // long-running hash outside the lanes (steady-state). A lane
+                    // line stays live via its own reports OR its file's byte
+                    // progress — the large lane names its file once, then the
+                    // progress stream keeps it fresh for the whole hash.
+                    const pinned: { key: string; tag: string; path: string; pct?: string }[] = [];
+                    for (const [lane, v] of lanes) {
+                      const prog = hashProg.get(v.path);
+                      const progFresh = prog && prog.done < prog.size && nowTick - prog.at < 5000;
+                      if (nowTick - v.at >= 5000 && !progFresh) continue;
+                      pinned.push({
+                        key: `lane-${lane}`, tag: lane, path: v.path,
+                        pct: progFresh ? `${((prog!.done / Math.max(1, prog!.size)) * 100).toFixed(2)}%` : undefined,
+                      });
+                    }
+                    for (const [path, v] of hashProg) {
+                      if (v.done >= v.size || nowTick - v.at >= 5000) continue;
+                      if (pinned.some((x) => x.path === path)) continue;
+                      pinned.push({ key: `prog-${path}`, tag: "", path, pct: `${((v.done / Math.max(1, v.size)) * 100).toFixed(2)}%` });
+                    }
+                    return pinned.map((x) => (
+                      <span className="sb-wlog-line sb-wlog-active" key={x.key}>
+                        <span className="recalc-spin" />
+                        {x.tag && <span className="sb-wlog-lane">{x.tag}</span>}
+                        <span className="sb-wlog-d" title={x.path}>{shortPath(x.path)}</span>
+                        {x.pct && <span className="sb-wlog-pct">{x.pct}</span>}
+                      </span>
+                    ));
+                  })()}
                   {watcherLog.slice().reverse().map((l) => (
                     <span className="sb-wlog-line" key={l.at + l.state + l.detail}>
                       <span className="sb-wlog-t">{new Date(l.at).toLocaleTimeString([], { hour12: false })}</span>
@@ -2342,7 +2535,7 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
       <div className="graph-zoom">
         <button className="graph-roothash" title={`root ${tree.sha256} — click to copy`} onClick={onCopyRoot}>
           <span className="graph-roothash-k">root</span>
-          <span className="graph-roothash-v">{shortHash(tree.sha256)}</span>
+          <span className="graph-roothash-v">{hashDots(tree.sha256)}</span>
           <span className="graph-roothash-ic" aria-hidden>{CopyIcon}</span>
         </button>
         <span className="graph-zspacer" />
@@ -2402,7 +2595,15 @@ function MerkleGraph({ tree, version, removing, onCopy, onCopyLink, onDownload, 
                     <circle cx={n.x} cy={n.y} r={R} style={dc ? { fill: dc, fillOpacity: 0.55, stroke: dc } : undefined} />
                     {n.collapsed && <text className="bubble-plus" x={n.x} y={n.y + 0.5}>+</text>}
                     <text className={`bubble-label${isRemoving ? " is-strike" : ""}`} x={n.x + R + 6} y={n.y - 1}>{label}</text>
-                    {n.sha && <text className="bubble-hash" x={n.x + R + 6} y={n.y + 10}>{n.sha.slice(0, 10)}</text>}
+                    {n.sha && (
+                      <text
+                        className="bubble-hash" x={n.x + R + 6} y={n.y + 10}
+                        onClick={(e) => { e.stopPropagation(); onCopy(n.sha); }}
+                      >
+                        <title>{`${n.sha}\u000a(click to copy)`}</title>
+                        {hashDots(n.sha)}
+                      </text>
+                    )}
                   </g>
                 );
               })}
@@ -2851,11 +3052,20 @@ function pathExists(root: TreeNode, path: string): boolean {
 function shortPath(p: string) {
   return p.length > 34 ? "…" + p.slice(-33) : p;
 }
-function shortHash(h: string) {
-  return h ? h.slice(0, 7) : "·······";
-}
 // hash-column format: ends of the hash with dots between (2cf2····9824) —
 // the tail catches copy/paste truncation that a prefix-only display hides
+// count hashed vs total descendant FILES of a directory node — drives the
+// "hashing · done/total" rollup shown while a dir's own hash is still unknown
+function countFileFill(n: TreeNode): { done: number; total: number } {
+  if (n.type === "file") return { done: n.sha256 ? 1 : 0, total: 1 };
+  let done = 0, total = 0;
+  for (const c of n.children ?? []) {
+    const f = countFileFill(c);
+    done += f.done;
+    total += f.total;
+  }
+  return { done, total };
+}
 function hashDots(h: string) {
   return h && h.length >= 8 ? `${h.slice(0, 4)}····${h.slice(-4)}` : "············";
 }
@@ -2961,7 +3171,7 @@ const CSS = `
   --accent-glow: rgba(22,225,160,0.45);
   --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
-  --gridcols: minmax(0,1fr) 110px 120px 118px;
+  --gridcols: minmax(0,1fr) 158px 164px 140px;
 
   min-height: 100vh; display: flex; flex-direction: column;
   background: radial-gradient(1100px 520px at 50% -140px, rgba(22,225,160,0.09), transparent 60%), var(--bg);
@@ -3181,7 +3391,8 @@ const CSS = `
 @keyframes node-pulse { 0%,100% { stroke: var(--accent); } 50% { stroke: #FFD43B; stroke-width: 3; } }
 .bubble-label { fill: var(--muted); font-family: var(--font-mono); font-size: 11px; pointer-events: none; dominant-baseline: middle; }
 .bubble.is-dir .bubble-label, .bubble.is-root .bubble-label { fill: var(--text); }
-.bubble-hash { fill: var(--faint); font-family: var(--font-mono); font-size: 9.5px; pointer-events: none; dominant-baseline: middle; }
+.bubble-hash { fill: var(--faint); font-family: var(--font-mono); font-size: 9.5px; cursor: pointer; dominant-baseline: middle; }
+.bubble-hash:hover { fill: var(--accent); }
 .bubble-label.is-strike { text-decoration: line-through; fill: #E0584F; }
 .bubble-more { fill: var(--muted); font-family: var(--font-mono); font-size: 12px; }
 /* "+N more" truncation marker (a folder has more children than are drawn) */
@@ -3582,7 +3793,9 @@ const CSS = `
   font-size: 10.5px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: var(--faint);
 }
 .col-size { text-align: right; }
-.col-hash { text-align: left; }
+.col-hash { text-align: right; }
+.hash-copy { cursor: pointer; border-radius: 5px; transition: color .12s, background .12s; }
+.hash-copy:hover { color: var(--accent); background: var(--accent-dim); }
 .col-act { text-align: center; }
 
 .rows { flex: 1; padding-bottom: 96px; /* clear the fixed upload button + sticky statusbar */ }
@@ -3643,7 +3856,7 @@ button.row { appearance: none; cursor: pointer; }
 .col-size.meta { text-align: right; }
 .hash {
   font-family: var(--font-mono); font-size: 12px; color: var(--muted); letter-spacing: 0.03em;
-  padding: 2px 8px; border-radius: 5px; background: var(--panel); justify-self: start; white-space: nowrap;
+  padding: 2px 8px; border-radius: 5px; background: var(--panel); justify-self: end; white-space: nowrap;
 }
 .hash.recalc {
   display: inline-flex; align-items: center; gap: 6px;
@@ -3656,6 +3869,29 @@ button.row { appearance: none; cursor: pointer; }
 }
 
 .col-act.actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.info-export { position: relative; display: inline-flex; }
+.info-export-scrim { position: fixed; inset: 0; z-index: 60; }
+.info-export-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 61;
+  display: flex; flex-direction: column; min-width: 150px; max-width: 240px; padding: 4px;
+  background: rgba(12,15,14,0.98); border: 1px solid var(--border-strong); border-radius: 8px;
+  box-shadow: 0 14px 36px -12px rgba(0,0,0,0.8); backdrop-filter: blur(8px);
+}
+.info-export-opt {
+  border: none; background: transparent; color: var(--text); cursor: pointer;
+  font-family: var(--font-mono); font-size: 11.5px; text-align: left;
+  padding: 6px 9px; border-radius: 5px; transition: background .1s, color .1s;
+}
+.info-export-opt:hover { background: var(--accent-dim); color: var(--accent); }
+.info-export-head {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text);
+  padding: 5px 9px 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border-bottom: 1px solid var(--border); margin-bottom: 3px;
+}
+.info-export-warn {
+  font-size: 10.5px; line-height: 1.35; color: #E8B84B;
+  padding: 4px 9px 5px; border-bottom: 1px solid var(--border); margin-bottom: 3px;
+}
 .act-btn {
   display: grid; place-items: center; width: 30px; height: 30px; border-radius: 7px;
   color: var(--muted); text-decoration: none; cursor: pointer;
@@ -3664,8 +3900,6 @@ button.row { appearance: none; cursor: pointer; }
 }
 .act-btn:hover { color: var(--accent); border-color: rgba(22,225,160,0.35); background: var(--accent-dim); }
 .act-btn.act-danger:hover { color: #E0584F; border-color: rgba(224,88,79,0.4); background: rgba(224,88,79,0.1); }
-.act-btn.act-placeholder { cursor: default; opacity: 0.18; pointer-events: none; }
-.act-btn.act-placeholder:hover { color: var(--muted); border-color: transparent; background: transparent; }
 
 .row.is-ghost { opacity: 0.6; }
 .row.is-ghost .nm { color: var(--muted); font-style: italic; }
@@ -3717,12 +3951,12 @@ button.row { appearance: none; cursor: pointer; }
 .sb-hlog--error .sb-wlog-d { color: #E0584F; }
 .sb-watcher-ic { display: grid; place-items: center; color: var(--faint); cursor: default; }
 .sb-watcher.is-idle .sb-watcher-ic { color: var(--muted); }
-.sb-watcher.is-hashing .sb-watcher-ic, .sb-watcher.is-scanning .sb-watcher-ic { color: #FFD43B; animation: watcher-blink 1s ease-in-out infinite; }
+.sb-watcher.is-hashing .sb-watcher-ic, .sb-watcher.is-scanning .sb-watcher-ic, .sb-watcher.is-starting .sb-watcher-ic { color: #FFD43B; animation: watcher-blink 1s ease-in-out infinite; }
 .sb-watcher.is-reconciling .sb-watcher-ic { color: #4DABF7; animation: watcher-blink 1s ease-in-out infinite; }
 @keyframes watcher-blink { 50% { opacity: 0.4; } }
 .sb-watcher-pop {
   position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%) translateY(4px);
-  display: flex; flex-direction: column; gap: 6px; width: 250px; padding: 10px 11px;
+  display: flex; flex-direction: column; gap: 6px; width: 340px; padding: 10px 11px;
   background: rgba(8,11,10,0.97); border: 1px solid var(--border-strong); border-radius: 9px;
   box-shadow: 0 14px 36px -12px rgba(0,0,0,0.8); backdrop-filter: blur(10px);
   opacity: 0; pointer-events: none; transition: opacity .14s, transform .14s; z-index: 30;
@@ -3732,6 +3966,12 @@ button.row { appearance: none; cursor: pointer; }
 .sb-wlog-t { color: var(--faint); flex: 0 0 auto; }
 .sb-wlog-s { color: var(--text); flex: 0 0 auto; }
 .sb-wlog-d { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* files actively being hashed: pinned above the log so a long-running hash
+   never scrolls out of view behind faster files */
+.sb-wlog-active { align-items: center; }
+.sb-wlog-active .sb-wlog-d { color: var(--text); flex: 1; }
+.sb-wlog-pct { color: #FFD43B; font-family: var(--font-mono); flex: 0 0 auto; margin-left: auto; }
+.sb-wlog-lane { color: var(--faint); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.06em; flex: 0 0 auto; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
 .statusbar {
   display: flex; align-items: center; gap: 18px;
   padding: 8px 22px; border-top: 1px solid var(--border);
