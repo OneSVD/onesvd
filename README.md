@@ -161,6 +161,32 @@ OneSVD runs on Linux; on Windows, install it inside WSL2.
 
 4. Open `http://localhost:7777` in a Windows browser.
 
+## Performance on WSL2: where your vault lives matters
+
+WSL2 has two kinds of storage, and the difference is dramatic for a tool that reads every byte:
+
+- **Native (ext4) paths** — anything inside the Linux filesystem, like the default `~/onesvd` —
+  run at full disk speed. This is where `ONESVD_ROOT` should live.
+- **Windows paths** — anything under `/mnt/c/...` — are reached through WSL2's 9P/drvfs bridge,
+  which adds protocol round-trips to every read. Hashing and scanning typically run **3–10×
+  slower** there, and it's the bridge, not OneSVD or your CPU, that sets the ceiling. File-change
+  events across the bridge are also less reliable; OneSVD's periodic reconcile sweep covers the
+  gaps, but changes may take a little longer to be noticed.
+
+Watching a Windows path is fully supported — it's just slower. If you point a node at `/mnt/c/...`,
+expect the initial scan and hashing of a large vault to take several times longer than the same data
+on ext4, and per-file hashing to lag native tools like `Get-FileHash` reading the same file through
+NTFS directly.
+
+**Recommended setup:** keep the vault on the Linux side and reach it *from* Windows instead of the
+reverse. Your WSL2 home is available in Explorer at:
+
+```
+\\wsl.localhost\Ubuntu\home\<user>\onesvd
+```
+
+Files dropped there land on ext4 and are fingerprinted at full speed.
+
 ## LAN access from WSL2
 
 If LAN devices can't reach OneSVD at `http://<host-ip>:7777`, Windows likely needs inbound firewall
