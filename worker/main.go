@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	ChunkSize      = 1024 * 1024
+	ChunkSize      = 4 * 1024 * 1024 // hash read buffer; larger reads matter a lot on 9P//drvfs mounts
 	Debounce       = 3 * time.Second
 	PubBuffer      = 256
 	MinBackoff     = 500 * time.Millisecond
@@ -190,19 +190,32 @@ func parentChain(r string) []string {
 // Hashing
 // ---------------------------------------------------------------------------
 
-func hashFile(path string) (string, error) {
+// sha256 of zero bytes — the hash of every empty file and every empty directory
+const emptySHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+func hashFile(path, rel string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
+	var size, done int64
+	if rel != "" {
+		if st, err := f.Stat(); err == nil {
+			size = st.Size()
+		}
+	}
 	h := sha256.New()
 	buf := make([]byte, ChunkSize)
 	for {
 		n, err := f.Read(buf)
 		if n > 0 {
 			_, _ = h.Write(buf[:n])
+			if rel != "" && size > 0 {
+				done += int64(n)
+				postHashProg(rel, done, size)
+			}
 		}
 		if err == io.EOF {
 			break
@@ -241,6 +254,10 @@ func sortedChildren(n *Node) []*Node {
 func recomputeDirHash(n *Node) {
 	hashes := make([]string, 0, len(n.children))
 	for _, c := range n.children {
+		if c.sha256 == "" { // a not-yet-hashed child makes this hash unknowable —
+			n.sha256 = ""   // better to say "unknown" than publish an interim lie
+			return
+		}
 		hashes = append(hashes, c.sha256)
 	}
 	sort.Strings(hashes)
@@ -333,12 +350,17 @@ func (s *Server) removeNode(r string) bool {
 	return true
 }
 
-func (s *Server) scan() error {
+// scan is PASS 1 of startup: a stat-only structure walk — no hashing. Even a
+// vault with hundreds of thousands of files completes in seconds, so the UI
+// gets the full layout (paths, names, sizes) immediately, with every hash
+// unknown (""). Returns the file list for hashFill (pass 2) to work through.
+func (s *Server) scan() ([]string, error) {
 	postStatus("scanning", "")
 	s.root = &Node{name: ".", path: ".", kind: "directory", children: map[string]*Node{}}
 	s.index = map[string]*Node{".": s.root}
 
-	var nFiles, nDirs int
+	var files []string
+	var nDirs int
 	err := filepath.WalkDir(Root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			logf("WARNING: walk %s: %v", path, err)
@@ -363,20 +385,25 @@ func (s *Server) scan() error {
 		if err != nil {
 			return nil
 		}
-		postStatus("scanning", r)
-		digest, err := hashFile(path)
-		if err != nil {
-			logf("WARNING: hash %s: %v", r, err)
+		if info.Size() == 0 {
+			// a zero-byte file's hash is definite without reading a thing —
+			// same constant as an empty dir. Stamp it now, skip the fill queue.
+			s.upsertFile(r, emptySHA, 0, info.ModTime().Unix())
 			return nil
 		}
-		s.upsertFile(r, digest, info.Size(), info.ModTime().Unix())
-		nFiles++
+		s.upsertFile(r, "", info.Size(), info.ModTime().Unix())
+		files = append(files, r)
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-
+	// Resolve every directory hash that doesn't depend on a file: an empty dir
+	// (or a chain of them) has a definite hash — sha256 of nothing — right now.
+	// Unknown-propagation leaves everything with unhashed file descendants at
+	// "", so this settles exactly the dirs that CAN be settled. Without it,
+	// empty dirs showed no hash until the whole fill finished, and their
+	// ancestors sat at "hashing 100%" long after all their files were done.
 	var dirs []*Node
 	for _, n := range s.index {
 		if n.kind == "directory" {
@@ -387,11 +414,180 @@ func (s *Server) scan() error {
 	for _, n := range dirs {
 		recomputeDirHash(n)
 	}
-
 	s.version = 1
-	logf("Scan complete: %d files, %d dirs", nFiles, nDirs)
-	postStatus("idle", "")
-	return nil
+	logf("Structure scan: %d files, %d dirs — skeleton published, hashing follows", len(files), nDirs)
+	return files, nil
+}
+
+// hashFill is PASS 2: compute real hashes for every file the structure scan
+// found, publishing progressively so hashes appear in the UI as they land
+// instead of after a very long silent scan.
+//
+// Two hashing workers run concurrently — one for large files, one for the
+// rest — so one enormous file can't stall the entire fill behind it. Workers
+// only hash (no shared state); a single applier goroutine performs all tree
+// mutation and publishing, keeping patch versions strictly ordered. Hashing
+// defers while a client is uploading, same as ordinary change processing.
+type hashedFile struct {
+	rel, digest string
+	size, mtime int64
+}
+
+func (s *Server) hashFill(files []string) {
+	const largeThreshold = 256 << 20 // 256 MB: big enough to be worth its own lane
+	var small, large []string
+	s.mu.Lock()
+	for _, r := range files {
+		if n := s.index[r]; n != nil && n.size >= largeThreshold {
+			large = append(large, r)
+		} else {
+			small = append(small, r)
+		}
+	}
+	s.mu.Unlock()
+
+	postStatus("starting", fmt.Sprintf("%d files to hash", len(files)))
+	results := make(chan hashedFile, 64)
+	var wg sync.WaitGroup
+	worker := func(queue []string, lane string) {
+		defer wg.Done()
+		for _, r := range queue {
+			for uploadsActive() {
+				time.Sleep(5 * time.Second)
+			}
+			path := abs(r)
+			info, err := os.Stat(path)
+			if err != nil {
+				continue // vanished since the structure scan; reconcile will settle it
+			}
+			postStatus("hashing", r)
+			postLane(lane, r)
+			digest, err := hashFile(path, r)
+			if err != nil {
+				logf("WARNING: hash %s: %v", r, err)
+				continue
+			}
+			results <- hashedFile{r, digest, info.Size(), info.ModTime().Unix()}
+		}
+		postLane(lane, "") // lane drained — clear its pinned line
+	}
+	wg.Add(2)
+	go worker(small, "small")
+	go worker(large, "large")
+	go func() { wg.Wait(); close(results) }()
+
+	// single applier: batch results, mutate the tree, publish in version order
+	batch := []hashedFile{}
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if msg := s.applyHashed(batch); msg != nil {
+			s.publish(*msg)
+		}
+		batch = batch[:0]
+	}
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case fh, ok := <-results:
+			if !ok {
+				flush()
+				s.finalizeDirs() // settle dirs no batch touched (e.g. empty ones)
+				postStatus("finished", fmt.Sprintf("%d files hashed", len(files)))
+				postStatus("idle", "")
+				logf("Hash fill complete: %d files", len(files))
+				return
+			}
+			batch = append(batch, fh)
+			if len(batch) >= 250 {
+				flush()
+			}
+		case <-tick.C:
+			flush()
+		}
+	}
+}
+
+// finalizeDirs recomputes every directory hash bottom-up and publishes the
+// changes. The fill batches only recompute ancestors of hashed FILES, so a
+// directory with no file descendants — an empty dir, or a dir of empty dirs —
+// would otherwise keep an unknown ("") hash forever.
+func (s *Server) finalizeDirs() {
+	s.mu.Lock()
+	var dirs []string
+	for p, n := range s.index {
+		if n.kind == "directory" {
+			dirs = append(dirs, p)
+		}
+	}
+	sort.Slice(dirs, func(i, j int) bool { return depth(dirs[i]) > depth(dirs[j]) })
+	changed := map[string]*Node{}
+	for _, d := range dirs {
+		n := s.index[d]
+		old := n.sha256
+		recomputeDirHash(n)
+		if n.sha256 != old {
+			changed[d] = n
+		}
+	}
+	if len(changed) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.version++
+	var changes []Change
+	for p, n := range changed {
+		changes = append(changes, Change{Op: "upsert", Path: p, Type: n.kind, SHA256: n.sha256, Size: n.size, MTime: n.mtime})
+	}
+	msg := Message{Version: s.version, Kind: "patch", Changes: changes}
+	s.mu.Unlock()
+	s.publish(msg)
+}
+
+// applyHashed is process()'s mutation phase without the stat/hash work — the
+// fill workers already did that. Must only run from one goroutine at a time.
+func (s *Server) applyHashed(files []hashedFile) *Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changed := map[string]*Node{}
+	affected := map[string]bool{}
+	for _, f := range files {
+		n := s.upsertFile(f.rel, f.digest, f.size, f.mtime)
+		changed[f.rel] = n
+		for _, p := range parentChain(f.rel) {
+			affected[p] = true
+		}
+	}
+
+	dirs := make([]string, 0, len(affected))
+	for d := range affected {
+		dirs = append(dirs, d)
+	}
+	sort.Slice(dirs, func(i, j int) bool { return depth(dirs[i]) > depth(dirs[j]) })
+	for _, d := range dirs {
+		n := s.index[d]
+		if n == nil || n.kind != "directory" {
+			continue
+		}
+		old := n.sha256
+		recomputeDirHash(n)
+		if n.sha256 != old {
+			changed[d] = n
+		}
+	}
+
+	if len(changed) == 0 {
+		return nil
+	}
+	s.version++
+	var changes []Change
+	for p, n := range changed {
+		changes = append(changes, Change{Op: "upsert", Path: p, Type: n.kind, SHA256: n.sha256, Size: n.size, MTime: n.mtime})
+	}
+	return &Message{Version: s.version, Kind: "patch", Changes: changes}
 }
 
 // reconcile walks the actual disk tree and compares it to the in-memory index,
@@ -485,7 +681,7 @@ func (s *Server) process(dirty map[string]bool) *Message {
 			dbg("stat dir            %s", r)
 		default:
 			postStatus("hashing", r)
-			digest, err := hashFile(path)
+			digest, err := hashFile(path, r)
 			if err != nil {
 				logf("WARNING: hash %s: %v", r, err)
 				continue
@@ -623,6 +819,8 @@ func (s *Server) publishRecalc(dirty map[string]bool) {
 var statusMu sync.Mutex
 var statusLastSent time.Time
 var statusLastState, statusLastDetail string
+var statusPendingState, statusPendingDetail string
+var statusPendingSet, statusFlushArmed bool
 
 // uploadsActive asks the hub whether any client is actively uploading. The
 // reconcile stat-walk competes with chunk appends for disk I/O, so the watcher
@@ -647,17 +845,57 @@ func uploadsActive() bool {
 	return r.Active > 0
 }
 
-func postStatus(state, detail string) {
-	statusMu.Lock()
-	same := state == statusLastState && detail == statusLastDetail
-	throttled := state != "idle" && time.Since(statusLastSent) < 750*time.Millisecond
-	if same || throttled {
-		statusMu.Unlock()
+// per-file hashing progress for the UI (row-level "hashing · N%"). Throttled to
+// one post per 500ms; the final done==size post always goes through so the row
+// can settle. Fire-and-forget like postStatus — never slows the hashing itself.
+// per-lane "currently hashing" reports for the UI's pinned view. The small
+// lane's files finish in milliseconds — byte-progress alone never pins them —
+// so each lane names its current file explicitly. rel=="" clears the lane.
+var laneMu sync.Mutex
+var laneLast = map[string]time.Time{}
+
+func postLane(lane, rel string) {
+	laneMu.Lock()
+	if rel != "" && time.Since(laneLast[lane]) < 500*time.Millisecond {
+		laneMu.Unlock()
 		return
 	}
-	statusLastSent = time.Now()
-	statusLastState, statusLastDetail = state, detail
-	statusMu.Unlock()
+	laneLast[lane] = time.Now()
+	laneMu.Unlock()
+	body, _ := json.Marshal(map[string]string{"kind": "lane", "lane": lane, "path": rel})
+	go func() {
+		resp, err := http.Post(IngestURL, "application/json", bytes.NewReader(body))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+}
+
+var hashProgMu sync.Mutex
+var hashProgLast = map[string]time.Time{} // per path: two concurrent hashers must not starve each other's updates
+
+func postHashProg(rel string, done, size int64) {
+	hashProgMu.Lock()
+	if done < size && time.Since(hashProgLast[rel]) < 500*time.Millisecond {
+		hashProgMu.Unlock()
+		return
+	}
+	if done >= size {
+		delete(hashProgLast, rel) // finished: no entry left behind
+	} else {
+		hashProgLast[rel] = time.Now()
+	}
+	hashProgMu.Unlock()
+	body, _ := json.Marshal(map[string]interface{}{"kind": "hashprog", "path": rel, "done": done, "size": size})
+	go func() {
+		resp, err := http.Post(IngestURL, "application/json", bytes.NewReader(body))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+}
+
+func sendStatus(state, detail string) {
 	body, _ := json.Marshal(map[string]string{"kind": "status", "state": state, "detail": detail})
 	go func() {
 		resp, err := http.Post(IngestURL, "application/json", bytes.NewReader(body))
@@ -665,6 +903,54 @@ func postStatus(state, detail string) {
 			resp.Body.Close()
 		}
 	}()
+}
+
+// postStatus rate-limits to one report per 750ms — but a throttled update is
+// DEFERRED, not dropped. Dropping meant a long file hash could leave the UI
+// stuck showing whatever happened to post just before the throttle window.
+func postStatus(state, detail string) {
+	statusMu.Lock()
+	if state == statusLastState && detail == statusLastDetail {
+		statusMu.Unlock()
+		return
+	}
+	// lifecycle markers (idle/starting/finished) are one-shot and must never be
+	// throttled or deferred — only the high-frequency per-file states are
+	throttleable := state == "hashing" || state == "scanning" || state == "reconciling"
+	if throttleable && time.Since(statusLastSent) < 750*time.Millisecond {
+		statusPendingState, statusPendingDetail, statusPendingSet = state, detail, true
+		if !statusFlushArmed {
+			statusFlushArmed = true
+			wait := 750*time.Millisecond - time.Since(statusLastSent)
+			time.AfterFunc(wait, flushStatus)
+		}
+		statusMu.Unlock()
+		return
+	}
+	statusLastSent = time.Now()
+	statusLastState, statusLastDetail = state, detail
+	statusPendingSet = false
+	statusMu.Unlock()
+	sendStatus(state, detail)
+}
+
+func flushStatus() {
+	statusMu.Lock()
+	statusFlushArmed = false
+	if !statusPendingSet {
+		statusMu.Unlock()
+		return
+	}
+	state, detail := statusPendingState, statusPendingDetail
+	statusPendingSet = false
+	if state == statusLastState && detail == statusLastDetail {
+		statusMu.Unlock()
+		return
+	}
+	statusLastSent = time.Now()
+	statusLastState, statusLastDetail = state, detail
+	statusMu.Unlock()
+	sendStatus(state, detail)
 }
 
 func postMessage(url string, m Message) (uint64, error) {
@@ -801,16 +1087,20 @@ func main() {
 	}
 
 	s := NewServer()
-	if err := s.scan(); err != nil {
+	files, err := s.scan()
+	if err != nil {
 		panic(err)
 	}
 	logf("OneSVD watcher started  (debug=%v)", Debug)
 	logf("Root: %s", Root)
 	logf("Hub ingest: %s", IngestURL)
-	logf("Initial rootHash=%s version=%d", s.root.sha256, s.version)
 
 	atomic.StoreInt32(&s.pubResync, 1)
 	go s.publisherLoop()
+
+	// pass 2: real hashes fill in progressively (the skeleton is already live)
+	s.hashFill(files)
+	logf("Initial rootHash=%s version=%d", s.root.sha256, s.version)
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
